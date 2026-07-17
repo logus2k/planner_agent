@@ -64,6 +64,37 @@ class GemmaClient:
         """Inline system+user -> parsed JSON dict, or None on any failure."""
         return self._call(system, user, temperature, max_tokens, json_mode=True)
 
+    def preset_json(self, agent: str, user: str) -> dict | None:
+        """Call an agent_server PRESET by name (reqoach's A1 pattern): the preset
+        supplies the system prompt + sampling; we send only the user content and
+        ask for JSON. This is the deployable path — the prompt lives on the server,
+        not in this code."""
+        payload = {
+            "model": agent,
+            "messages": [{"role": "user", "content": user}],
+            "response_format": {"type": "json_object"},
+        }
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = json.loads(resp.read().decode())
+            content = data["choices"][0]["message"]["content"]
+        except (urllib.error.URLError, KeyError, IndexError, ValueError,
+                TimeoutError) as e:
+            with self._lock:
+                self.calls += 1
+                self.total_s += time.time() - t0
+            print(f"    ! preset {agent} failed: {type(e).__name__}: {str(e)[:100]}")
+            return None
+        with self._lock:
+            self.calls += 1
+            self.total_s += time.time() - t0
+        return _parse_json(content)
+
     def complete_text(self, system: str, user: str,
                       temperature: float | None = None,
                       max_tokens: int | None = None) -> str | None:
