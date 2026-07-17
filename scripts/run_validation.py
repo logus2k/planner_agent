@@ -26,11 +26,14 @@ def main():
                     help="requirements sampled per quality bucket (default 3)")
     ap.add_argument("--out", default=None, help="output dir (default: <repo>/data/validation)")
     ap.add_argument("--base-url", default=None, help="agent_server URL")
+    ap.add_argument("--concurrency", type=int, default=2,
+                    help="parallel requests = llama.cpp slots (default 2)")
     args = ap.parse_args()
 
     project_dir = os.path.expanduser(args.project_dir)
     out = args.out or os.path.join(os.path.dirname(__file__), "..", "data", "validation")
-    run(project_dir, per_bucket=args.per_bucket, out_dir=out, base_url=args.base_url)
+    run(project_dir, per_bucket=args.per_bucket, out_dir=out, base_url=args.base_url,
+        concurrency=args.concurrency)
 
 
 if __name__ == "__main__":

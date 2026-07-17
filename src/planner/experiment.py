@@ -10,11 +10,11 @@ then asks how well the a-priori signals predict the outcome.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
 import os
 import time
-from dataclasses import asdict
 
 from . import loader, proxies, stages
 
@@ -46,8 +46,30 @@ def _run_task(client, task: dict, source_req, depth: int) -> dict:
     }
 
 
+def _process_requirement(client, req) -> dict:
+    """All work for one requirement (both arms). Runs in a worker thread; the
+    calls inside are sequential, so each worker holds one slot at a time."""
+    bkt = loader.bucket_of(req.avg_score)
+    # Arm 1 — direct: the whole requirement as a single task.
+    direct_task = {
+        "title": f"Implement {req.req_id}",
+        "kind": "code",
+        "deliverable": "implementation satisfying the requirement",
+        "instructions": req.text,
+    }
+    direct = _run_task(client, direct_task, req, depth=-1)
+    # Arm 2 — decomposed: plan into tasks, judge/execute each.
+    tasks = stages.decompose(client, req.text, _quality_hint(req))
+    task_recs = [_run_task(client, t, req, depth=0) for t in tasks]
+    return {
+        "req_id": req.req_id, "bucket": bkt, "avg_score": req.avg_score,
+        "quality_signals": req.quality_signals, "text": req.text,
+        "direct": direct, "decomposed": task_recs,
+    }
+
+
 def run(project_dir: str, per_bucket: int, out_dir: str,
-        base_url: str | None = None) -> dict:
+        base_url: str | None = None, concurrency: int = 2) -> dict:
     from .client import GemmaClient
 
     client = GemmaClient(base_url=base_url)
@@ -56,50 +78,43 @@ def run(project_dir: str, per_bucket: int, out_dir: str,
     sample = loader.sample_by_bucket(reqs, per_bucket)
     print(f"scorecard: {scorecard}")
     print(f"requirements: {len(reqs)} total, {len(sample)} sampled "
-          f"({per_bucket}/bucket)\n")
+          f"({per_bucket}/bucket) · concurrency={concurrency} (llama.cpp slots)\n")
 
+    # concurrency workers, each holding one slot -> uses all configured slots
+    # without oversubscribing (a 3rd concurrent request would queue on the server).
     records = []
     t0 = time.time()
-    for i, req in enumerate(sample, 1):
-        bkt = loader.bucket_of(req.avg_score)
-        print(f"[{i}/{len(sample)}] {req.req_id} avg={req.avg_score} ({bkt}) "
-              f"C5={req.quality_signals.get('C5_singular')}")
-        print(f"    {req.text[:100]}")
-
-        # Arm 1 — direct: the whole requirement as a single task.
-        direct_task = {
-            "title": f"Implement {req.req_id}",
-            "kind": "code",
-            "deliverable": "implementation satisfying the requirement",
-            "instructions": req.text,
-        }
-        print("    arm=direct ...", flush=True)
-        direct = _run_task(client, direct_task, req, depth=-1)
-        print(f"      feasible={direct['feasibility']['verdict']} "
-              f"outcome={direct['outcome']['success']}")
-
-        # Arm 2 — decomposed: plan into tasks, judge/execute each.
-        tasks = stages.decompose(client, req.text, _quality_hint(req))
-        print(f"    arm=decomposed -> {len(tasks)} tasks", flush=True)
-        task_recs = []
-        for j, t in enumerate(tasks, 1):
-            rec = _run_task(client, t, req, depth=0)
-            task_recs.append(rec)
-            print(f"      task {j}: feasible={rec['feasibility']['verdict']} "
-                  f"outcome={rec['outcome']['success']} :: {t['title'][:60]}")
-
-        records.append({
-            "req_id": req.req_id, "bucket": bkt, "avg_score": req.avg_score,
-            "quality_signals": req.quality_signals, "text": req.text,
-            "direct": direct, "decomposed": task_recs,
-        })
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = {ex.submit(_process_requirement, client, req): req for req in sample}
+        for fut in concurrent.futures.as_completed(futures):
+            req = futures[fut]
+            done += 1
+            try:
+                rec = fut.result()
+            except Exception as e:  # noqa: BLE001 — never let one req kill the run
+                print(f"[{done}/{len(sample)}] {req.req_id} FAILED: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                continue
+            records.append(rec)
+            dv = rec["direct"]["feasibility"]["verdict"]
+            do = rec["direct"]["outcome"]["success"]
+            npass = sum(1 for t in rec["decomposed"] if t["outcome"]["success"])
+            print(f"[{done}/{len(sample)}] {rec['req_id']} ({rec['bucket']}) "
+                  f"direct[{dv}->{do}] decomposed[{npass}/{len(rec['decomposed'])} pass]",
+                  flush=True)
 
     elapsed = time.time() - t0
+    if client.truncated:
+        print(f"\n!! {client.truncated} completion(s) hit the token cap — "
+              f"inspect before trusting outcomes")
     result = {
         "project_dir": project_dir, "scorecard": scorecard,
         "n_requirements_total": len(reqs), "n_sampled": len(sample),
-        "per_bucket": per_bucket, "elapsed_s": round(elapsed, 1),
+        "per_bucket": per_bucket, "concurrency": concurrency,
+        "elapsed_s": round(elapsed, 1),
         "llm_calls": client.calls, "llm_total_s": round(client.total_s, 1),
+        "truncated_completions": client.truncated,
         "records": records,
     }
     os.makedirs(out_dir, exist_ok=True)
@@ -233,7 +248,11 @@ def render_report(result: dict, a: dict) -> str:
     L.append(f"- Project dir: `{result['project_dir']}`")
     L.append(f"- Requirements sampled: **{result['n_sampled']}** of "
              f"{result['n_requirements_total']} ({result['per_bucket']}/bucket)")
-    L.append(f"- LLM calls: {result['llm_calls']} · wall time: {result['elapsed_s']}s")
+    L.append(f"- LLM calls: {result['llm_calls']} · wall time: {result['elapsed_s']}s "
+             f"· concurrency: {result.get('concurrency', 1)}")
+    tc = result.get("truncated_completions", 0)
+    flag = "" if tc == 0 else "  ⚠️ inspect — truncated artifacts poison outcomes"
+    L.append(f"- Truncated completions (finish_reason=length): **{tc}**{flag}")
     L.append("- Executor & judge: Gemma 4 E4B (same model — self-judged; treat as a "
              "soft/optimistic ground truth, spot-check by hand)\n")
 

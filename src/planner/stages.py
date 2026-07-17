@@ -108,8 +108,11 @@ _OUTCOME_SYS = (
 
 
 def outcome_judge(client, task: dict, attempt: str) -> dict:
+    # Full attempt, no truncation: execute is capped at 8192 output tokens, so the
+    # judge's input (task + attempt) stays well inside one 32K slot. Judging a
+    # truncated artifact would be worse than not judging it.
     user = (f"TASK TITLE: {task['title']}\nDELIVERABLE: {task['deliverable']}\n"
-            f"INSTRUCTIONS: {task['instructions']}\n\n--- ATTEMPT ---\n{attempt[:6000]}")
+            f"INSTRUCTIONS: {task['instructions']}\n\n--- ATTEMPT ---\n{attempt}")
     res = client.complete_json(_OUTCOME_SYS, user, temperature=0.0)
     if not res or not isinstance(res.get("success"), bool):
         return {"success": None, "confidence": 0.0, "reason": "judge failed"}
