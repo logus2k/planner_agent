@@ -9,6 +9,8 @@ the feasibility gate; genuine unknowns become questions, never fabricated tasks.
 from __future__ import annotations
 
 import itertools
+import json
+from collections import Counter
 from dataclasses import dataclass, field
 
 _ids = itertools.count(1)
@@ -43,7 +45,7 @@ def _gate(client, task: PlanTask, available: list[str] | None = None) -> dict:
     return client.preset_json("planner_feasibility_reason", u) or {"verdict": "unknown"}
 
 
-def _refine(client, task: PlanTask, feas: dict) -> dict:
+def _refine_once(client, task: PlanTask, feas: dict) -> dict:
     u = (f"TASK TITLE: {task.title}\nKIND: {task.kind}\n"
          f"DELIVERABLE: {task.deliverable}\nINSTRUCTIONS: {task.instructions}\n"
          f"MISSING (the gap): {feas.get('missing','')}\n"
@@ -51,7 +53,34 @@ def _refine(client, task: PlanTask, feas: dict) -> dict:
     return client.preset_json("planner_refine", u) or {}
 
 
-def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3, log=print) -> dict:
+def _title_key(ref: dict) -> tuple:
+    """Canonical key for a refine result: (action, sorted new-task titles)."""
+    return (ref.get("action"),
+            tuple(sorted((t.get("title", "") for t in (ref.get("new_tasks") or [])))))
+
+
+def _refine(client, task: PlanTask, feas: dict, k: int = 1) -> dict:
+    """Self-consistent refine. With k=1, a single call. With k>1, sample k times,
+    MAJORITY-VOTE the action (the categorical decision that drives control flow),
+    then among the winning-action samples pick the modal (title-set) representative —
+    deterministic tie-break. Turns per-call generative variation into a stable consensus."""
+    if k <= 1:
+        return _refine_once(client, task, feas)
+    samples = [_refine_once(client, task, feas) for _ in range(k)]
+    samples = [s for s in samples if s.get("action")]
+    if not samples:
+        return {}
+    maj_action = Counter(s["action"] for s in samples).most_common(1)[0][0]
+    winners = [s for s in samples if s["action"] == maj_action]
+    # representative: modal title-set among winners; tie-break by canonical JSON.
+    key_counts = Counter(_title_key(s) for s in winners)
+    top_key = key_counts.most_common(1)[0][0]
+    reps = [s for s in winners if _title_key(s) == top_key]
+    return sorted(reps, key=lambda s: json.dumps(s, sort_keys=True))[0]
+
+
+def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
+               refine_k: int = 1, log=print) -> dict:
     """Run the bounded gate->refine loop over seed tasks. Returns the plan:
     feasible tasks (+ dependency edges), escalated questions, and flagged tasks.
 
@@ -83,7 +112,7 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3, log=print
             log(f"  [FLAGGED after {refines} refines] {task.title[:52]} ({v})")
             continue
 
-        ref = _refine(client, task, feas)
+        ref = _refine(client, task, feas, k=refine_k)
         action = ref.get("action")
         new = ref.get("new_tasks") or []
         if action == "question":

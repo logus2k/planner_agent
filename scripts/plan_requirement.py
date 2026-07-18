@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--idxs", help="requirement sample idxs (with --reqoach)")
     ap.add_argument("--frozen", help="comma idxs of frozen tasks to use as seeds directly")
     ap.add_argument("--budget", type=int, default=3, help="refine_budget: max reprocessings per task lineage")
+    ap.add_argument("--k", type=int, default=1, help="refine_k: self-consistency samples per refine (majority-vote action)")
     args = ap.parse_args()
     client = GemmaClient()
 
@@ -48,7 +49,7 @@ def main():
         print()
 
     print("=== loop ===")
-    plan = plan_tasks(client, seeds, refine_budget=args.budget)
+    plan = plan_tasks(client, seeds, refine_budget=args.budget, refine_k=args.k)
 
     print("\n" + "=" * 70)
     print(f"PLAN: {len(plan['feasible'])} feasible · {len(plan['questions'])} questions · "
