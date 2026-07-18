@@ -75,7 +75,7 @@ def main():
             cat = "builder_flake"; clean = False; stubs = 0; produced = compiles = False
         else:
             produced, compiles, _ = oc.mechanical(files, wd)
-            stubs = len(oc.stub_signals(files, wd))
+            stubs = len(oc.stub_signals(files, wd, td["title"], td["kind"]))
             clean = bool(produced and compiles and stubs < 2)
             cat = "RECALL-MISS(clean)" if clean else "correctly-flagged(stub/broken)"
         rows.append({"title": t.title, "deliverable": t.deliverable, "clean": clean,

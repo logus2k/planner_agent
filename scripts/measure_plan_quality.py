@@ -77,7 +77,7 @@ def main():
             category, produced, compiles, stubs, clean = "builder_flake", False, False, 0, False
         else:
             produced, compiles, _ = oc.mechanical(files, wd)
-            stubs = len(oc.stub_signals(files, wd))
+            stubs = len(oc.stub_signals(files, wd, td["title"], td["kind"]))
             clean = bool(produced and compiles and stubs < 2)
             category = "clean" if clean else "quality_fail"  # produced but stub/broken
 
