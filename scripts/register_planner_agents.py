@@ -42,7 +42,9 @@ PRESETS = {
     "planner_feasibility": ("planner_feasibility.txt", JUDGE_PARAMS),
     "planner_feasibility_think": ("planner_feasibility_reason.txt", JUDGE_THINK_PARAMS),
     "planner_feasibility_reason": ("planner_feasibility_reason.txt", JUDGE_REASON_NOTHINK_PARAMS),
+    "planner_outcome": ("planner_outcome.txt", JUDGE_PARAMS),
     "planner_decompose": ("planner_decompose.txt", DECOMPOSE_PARAMS),
+    "planner_refine": ("planner_refine.txt", DECOMPOSE_PARAMS),
 }
 
 
