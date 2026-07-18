@@ -26,12 +26,14 @@ class PlanTask:
     depends_on: list[str] = field(default_factory=list)
     feasibility: dict | None = None      # the gate verdict that admitted it
     origin: str = "decomposed"           # decomposed | split | prerequisite | resolved
+    traces_to: list[str] = field(default_factory=list)   # source requirement id(s) — no task without a trace
 
 
-def _mk(t: dict, origin: str) -> PlanTask:
+def _mk(t: dict, origin: str, traces_to=None) -> PlanTask:
     return PlanTask(task_id=f"T{next(_ids):03d}", title=t.get("title", ""),
                     kind=t.get("kind", "code"), deliverable=t.get("deliverable", ""),
-                    instructions=t.get("instructions", ""), origin=origin)
+                    instructions=t.get("instructions", ""), origin=origin,
+                    traces_to=list(traces_to if traces_to is not None else t.get("traces_to") or []))
 
 
 def _gate(client, task: PlanTask, available: list[str] | None = None) -> dict:
@@ -120,14 +122,14 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
                               "gap": feas.get("missing", "")})
             log(f"  [QUESTION] {task.title[:45]} -> {ref.get('question','')[:70]}")
         elif action == "split":
-            children = [_mk(nt, "split") for nt in new]
+            children = [_mk(nt, "split", traces_to=task.traces_to) for nt in new]
             for c in children:
                 work.append((c, refines + 1, avail))
             log(f"  [split -> {len(children)}] {task.title[:50]}")
         elif action == "prerequisite":
             di = ref.get("depends_on_new_task_index")
-            prereq = _mk(new[di], "prerequisite") if (new and di is not None
-                                                      and di < len(new)) else None
+            prereq = _mk(new[di], "prerequisite", traces_to=task.traces_to) if (
+                new and di is not None and di < len(new)) else None
             if prereq is None:
                 flagged.append({"task": task, "feasibility": feas,
                                 "reason": "prerequisite action without a valid new task"})
@@ -137,7 +139,7 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
             work.append((task, refines + 1, avail + [prereq.deliverable]))  # re-judge w/ prereq
             log(f"  [prerequisite] {task.title[:45]} needs -> {prereq.title[:35]}")
         elif action == "resolve":
-            rt = _mk(new[0], "resolved") if new else task
+            rt = _mk(new[0], "resolved", traces_to=task.traces_to) if new else task
             rt.depends_on = task.depends_on
             work.append((rt, refines + 1, avail))
             log(f"  [resolve] {task.title[:50]} (assume: {ref.get('assumption','')[:40]})")
