@@ -26,8 +26,13 @@ _DECOMPOSE_SYS = (
 )
 
 
-def decompose(client, req_text: str, quality_hint: str = "") -> list[dict]:
+def decompose(client, req_text: str, quality_hint: str = "", arch_context: str = "") -> list[dict]:
     user = req_text if not quality_hint else f"{req_text}\n\n[quality note: {quality_hint}]"
+    if arch_context:
+        # The Architect already decided what the system is made of — decompose against it
+        # instead of inventing a structure per task.
+        user += ("\n\nARCHITECTURE (authoritative — use these names, do not invent components):\n"
+                 + arch_context)
     res = client.complete_json(_DECOMPOSE_SYS, user, temperature=0.2)
     if not res or not isinstance(res.get("tasks"), list):
         return []

@@ -15,12 +15,15 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Requirement:
-    req_id: str
+    req_id: str           # the TRACE KEY (Analyst `req_id`, e.g. REQ-0005) — use verbatim
     text: str
     section: str
     avg_score: float
     scores: dict          # {"C1": 5, "C4": 2, ...}
     quality_signals: dict = field(default_factory=dict)   # C4/C5/C7 pulled out
+    # Analyst routing contract (empty until the Analyst's classify:run has been run):
+    classes: list = field(default_factory=list)       # functional|structural|interface|…
+    constraints: list = field(default_factory=list)   # closed vocab: latency, throughput, …
 
 
 def _avg(scores: dict) -> float:
