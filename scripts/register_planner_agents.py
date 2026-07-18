@@ -30,7 +30,9 @@ JUDGE_PARAMS = {"max_tokens": 512, "temperature": 0.0, "top_p": 0.9,
 # the JSON, so the cap is high to avoid truncating the answer.
 JUDGE_THINK_PARAMS = {"max_tokens": 4096, "temperature": 0.0, "top_p": 0.9,
                       "chat_template_kwargs": {"enable_thinking": True}}
-DECOMPOSE_PARAMS = {"max_tokens": 2048, "temperature": 0.2, "top_p": 0.9,
+# temperature 0 for reproducible plans — the planner must be deterministic run-to-run
+# (up to GPU non-determinism), not creative.
+DECOMPOSE_PARAMS = {"max_tokens": 2048, "temperature": 0.0, "top_p": 0.9,
                     "chat_template_kwargs": {"enable_thinking": False}}
 
 # Hybrid: reasoning-scripted prompt but thinking OFF — the per-criterion reasoning is
