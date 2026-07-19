@@ -13,9 +13,9 @@ It runs entirely on a **local model (Gemma 4)** — nothing leaves your machine,
 offline.
 
 ```
-reqoach  ──►  Planner Agent  ──►  builder_agent
-requirements   a plan of buildable   builds each task
-+ gaps         tasks + open questions  (also local)
+analyst_agent  ──►  architect_agent  ──►  Planner Agent  ──►  builder_agent
+validated          the system's           a plan of buildable    builds each task
+requirements       structure (optional)   tasks + open questions  (also local)
 ```
 
 ---
@@ -51,9 +51,10 @@ the tasks — or to a human team.
   requirements.
 - **Everything is traceable.** Every task points back to the requirement it satisfies, so you can
   always answer "why is this task here?".
-- **It closes the loop from requirements to code.** Paired with reqoach (which produces good
-  requirements) and builder_agent (which builds the plan), you get requirements → plan → working
-  artifacts, all on local infrastructure.
+- **It closes the loop from requirements to code.** Paired with the Analyst Agent (which produces
+  validated requirements), the Architect Agent (which defines the system's structure), and
+  builder_agent (which builds the plan), you get requirements → plan → working artifacts, all on
+  local infrastructure.
 
 ---
 
@@ -79,15 +80,16 @@ a data source) is a real unknown worth asking about.
 
 ## Quickstart
 
-You'll need agent_server running locally with a Gemma model, and a reqoach project to plan from.
+You'll need the Analyst Agent running (`:7803`) with an analysed project, and agent_server with a
+local Gemma model. An Architect handover for the project is used automatically if present.
 
 ```bash
 # register the local-model prompts (one-time, idempotent)
 python scripts/register_planner_agents.py
 
-# turn a reqoach project into a plan
-python scripts/produce_plan.py <reqoach_project_dir> --limit 10
-#   -> data/plans/<project>.plan.json
+# turn an analysed project into a plan (--workers N to parallelise, --checkpoint to make it resumable)
+python scripts/produce_plan.py <PROJECT_ID> --limit 10
+#   -> data/plans/<PROJECT_ID>.plan.json
 ```
 
 ---
@@ -98,7 +100,7 @@ python scripts/produce_plan.py <reqoach_project_dir> --limit 10
   instructions, its dependencies, and a link back to its source requirement.
 - **questions** — genuine unknowns for the requirements author to answer.
 - **flagged** — requirements/tasks that couldn't be reduced to something buildable.
-- **coverage_gaps** — missing-requirement concerns carried over from reqoach.
+- **coverage_gaps** — missing-requirement concerns carried over from the Analyst's coverage analysis.
 - **graph** — how the ready tasks depend on each other.
 
 ---
@@ -107,7 +109,8 @@ python scripts/produce_plan.py <reqoach_project_dir> --limit 10
 
 | Stage | Project | Role |
 |---|---|---|
-| Requirements | [reqoach](../../labs/requirements) | score requirements, find coverage gaps |
+| Requirements | [analyst_agent](../analyst_agent) | validate & score requirements, find coverage gaps |
+| Architecture | [architect_agent](../architect_agent) | define components/interfaces/constraints (optional) |
 | **Plan** | **Planner Agent** (this repo) | **break into buildable tasks + surface open questions** |
 | Build | [builder_agent](../builder_agent) | build each task locally and verify it |
 

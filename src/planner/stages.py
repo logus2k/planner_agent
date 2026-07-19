@@ -33,7 +33,9 @@ def decompose(client, req_text: str, quality_hint: str = "", arch_context: str =
         # instead of inventing a structure per task.
         user += ("\n\nARCHITECTURE (authoritative — use these names, do not invent components):\n"
                  + arch_context)
-    res = client.complete_json(_DECOMPOSE_SYS, user, temperature=0.2)
+    # Use the registered preset (temp 0, deterministic) — the prompt is identical to the
+    # former inline _DECOMPOSE_SYS, so this only reconciles config, not behavior.
+    res = client.preset_json("planner_decompose", user)
     if not res or not isinstance(res.get("tasks"), list):
         return []
     tasks = []

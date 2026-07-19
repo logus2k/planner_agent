@@ -1,113 +1,104 @@
-# Planner Agent — Implementation Plan
+# Planner Agent — Implementation Roadmap
 
-Status: Plan (pre-implementation)
-Scope: phased, shippable build order for the architecture in
-[technical_architecture.md](technical_architecture.md). Each phase leaves the app working
-and is independently demoable. Mirrors reqoach's build discipline: reuse its LLM client,
-streaming job core, and single-container deploy; verify every stage against real reqoach
-`store/` data.
+Status: **living roadmap**, 2026-07-19. Reflects what is built vs what remains, consistent with
+the as-built [technical_architecture.md](technical_architecture.md). (The earlier version of this
+file described a 6-stage design that was never implemented — superseded.)
 
-Guiding order: **prove the input plumbing and a naive decomposition end-to-end first, then
-add the granularity gate (the novel part), then sequencing, then the frame/quality-signal
-sophistication.** The hard, calibratable part — "small enough for Gemma" — comes only after
-tasks flow through the pipeline at all.
+Non-negotiables (hold across all work): every task `traces_to` a `req_id`; judges degrade, never
+raise; genuine unknowns become questions (never fabricated tasks); **local models + deterministic
+code only, no Claude at runtime, offline-capable**.
 
 ---
 
-## Phase 0 — Skeleton + reqoach input adapter  *(no planning yet)*
-The load-bearing plumbing.
-- Package `planner` under `src/`; copy reqoach's `AgentServerClient` (`llm/client.py`).
-- **Input adapter**: given a reqoach `store/projects/<pid>/`, load the latest
-  `scorecard.json`, `coverage.json`, `problem_statement.json`, `coverage_profile.json`.
-  Validate shapes against the real files in `~/env/labs/requirements/store`.
-- Normalize to the **PlanItem** stream (§3): requirements (drop `duplicate_of`) + gaps,
-  each with domain + quality_signals attached.
-- CLI: `python scripts/load_project.py <reqoach_pid>` → prints N requirements, N gaps.
+## Part A — Built (done)
 
-**Done when:** the adapter reads a real reqoach project and emits a correct PlanItem list.
-
----
-
-## Phase 1 — Naive decompose → flat task list  *(no gate, no graph)*
-Get tasks flowing end-to-end, even if coarse.
-- `planner_decompose` preset (agent_server); `register_planner_agents.py` (POST, 409→PUT).
-- Stage 2 only: each PlanItem → candidate tasks (single pass, no recursion).
-- Stage 5 minimal: attach a naive acceptance check per task.
-- Emit a flat `plan.json` (tasks[], each `traces_to` its source). No `graph`, no `frame`.
-- CLI: `python scripts/produce_plan.py <reqoach_pid> plan.json`.
-
-**Done when:** a real project produces a flat, fully-traced task list. Spot-check that every
-task traces to a requirement or gap (anti-hallucination contract).
-
----
-
-## Phase 2 — Granularity gate (the linchpin, recursive)
-The core bet: reduce every task to Gemma-size.
-- `planner_granularity` preset scoring the 5 atomicity criteria (§5) → `atomic|split`.
-- Stage 3 recursion: `split` → re-decompose, bounded depth (3); still-not-atomic at max
-  depth → emit flagged + push to `unresolved[]`.
-- Tasks gain `granularity{ verdict, confidence, rationale, depth }`.
-
-**Done when:** compound requirements visibly fan out into multiple atomic tasks; oversized
-tasks are flagged, not hidden. Verified on a known-compound requirement (e.g. a C5=1 item).
+- **A1 · Analyst input** — `analyst.py`: `GET :7803/projects/{pid}/package` → requirements keyed on
+  `req_id` verbatim, + coverage gaps, problem statement, readiness manifest. Replaced the deleted
+  reqoach `store/`. *Verified live.*
+- **A2 · Decompose** — `stages.decompose` → `planner_decompose` preset (temp 0). Decomposes a
+  requirement into candidate tasks; injects Architect context when a handover exists.
+- **A3 · Bounded gate→refine loop** — `loop.plan_tasks`: feasibility gate
+  (`planner_feasibility_reason`, tuned, execution-validated) → refine
+  (`planner_refine`, honesty-tuned: split/prerequisite/resolve/question) → `refine_budget`
+  termination. Prerequisite reuse + prerequisite-aware re-judge. *Gate + refiner tuned this project.*
+- **A4 · Architect handover integration** — `architecture.py`: decompose-against-architecture,
+  component-name precedence (collision-safe), constraint-based acceptance, open-issue surfacing.
+  Defensive (missing file → runs as before). *Verified against a real 386-req handover.*
+- **A5 · Dedup** — `loop.dedup_plan`: union-find on title|deliverable, rewire deps, union traces.
+  Runs after naming. *Verified: zero dup deliverables, DAG intact.*
+- **A6 · plan.json emission** — `pipeline.assemble_plan`: feasible tasks (contract + acceptance +
+  deps + traces + feasibility), questions, flagged, coverage_gaps, architecture provenance +
+  open issues, prerequisite DAG. `scripts/produce_plan.py <PROJECT_ID>`.
+- **A7 · Scale plumbing** — per-requirement restructure → `--workers N` (thread pool; backend has
+  **2 llama.cpp slots**, so ~2× real) + `--checkpoint PATH` (JSON-lines WAL, resume by `req_id`
+  delta; `advance_ids` avoids id collisions). *Verified E2E: serial+ckpt then resume+threaded.*
+- **A8 · Downstream** — `builder_agent` MVP exists (separate repo): consumes `plan.json`, builds via
+  opencode, verifies deterministically.
 
 ---
 
-## Phase 3 — Sequencing (dependency DAG)
-Turn the task list into an ordered graph.
-- Structural edges from a task-kind ordering (`schema → code → test`, data-before-endpoints).
-- `planner_sequence` preset for semantic edges (shared entity / producer→consumer); reuse
-  reqoach's reranker-overlap machinery if it fits.
-- Build `graph{ nodes, edges }`; cycle-check → cycles go to `unresolved[]`.
-- Emit topological order + the DAG.
+## Part B — Next (prioritised)
 
-**Done when:** `plan.json` carries a valid DAG; a topological task list is renderable and
-dependency-sane on a real project.
+### B1 · Full-scale run (386 requirements) — *highest value, low effort now*
+The only real test that cross-requirement dedup and the DAG hold on genuine overlap. Feasible now
+(resumable + ~2×). Run, inspect the plan, fix whatever the scale surfaces.
+**Done when:** a 386-req plan is produced and its DAG/dedup/questions are sane.
 
----
+### B2 · Packaging + service + minimal UI
+No Dockerfile/compose/requirements today (unlike Analyst/Architect); CLI + JSON only. Add packaging;
+wrap `produce_plan` in a small service that streams the loop's existing `log=` events (socket.io or
+SSE); a read-only page: tasks appearing as they pass the gate, the DAG, a traceability drawer.
+**Done when:** pick a project in a browser, run, watch it stream, inspect the plan + traces.
 
-## Phase 4 — Frame + quality-signal-driven decomposition
-Make the plan domain-aware and quality-aware (§6).
-- Stage 0 Frame: resolve archetype(s)/`class` from the Coverage Profile → per-domain
-  **task-kind policy** (code vs. process vs. docs). Read reqoach `catalog/` read-only.
-- Feed C1–C9 signals into Stage 2: split along low-C5 seams; low C3/C4 → low-confidence +
-  clarifying question; low C7 → `acceptance.kind = "review"`; `gap.severity` → `priority`.
+### B3 · Semantic sequencing (enrich the DAG)
+Today the DAG has only prerequisite edges. Add cross-task dependency detection via the **reranker**
+(`:8601` `/v1/rerank`, sigmoid-scaled — *not* raw cosine, per house rule): candidate pairs by
+shared entity / producer→consumer, LLM-confirm above threshold. Cycle-check.
+**Done when:** the DAG carries real cross-task edges beyond prerequisites, cycle-free.
 
-**Done when:** a `functional` requirement yields code/test tasks while a `legal-privacy`
-requirement yields process/docs tasks; poorly-scored requirements produce flagged tasks +
-questions instead of confident guesses.
+### B4 · Memoization / per-project cache — **IMMEDIATE NEXT TASK**
+Cache per-requirement loop results by input-hash in a per-project file so a re-plan after a small
+change reprocesses only the changed requirements. Concrete design (turnkey — most parts already exist):
+- **Generalize `checkpoint.py` into a hash-keyed project cache** (it subsumes resume: a cached input
+  hash = already-done). Key = `sha1(req.text + arch_context + CACHE_VERSION)`; `CACHE_VERSION` folds
+  in the decompose/gate/refine prompt versions so retuning a preset auto-invalidates.
+- **Store:** per-project file `data/cache/<project_id>.jsonl`, reusing `_res_to_dict`/`_res_from_dict`.
+- **Wire into `pipeline.plan_project`** per-requirement loop: compute key → hit reuses the cached
+  result, miss plans + stores. Call `loop.advance_ids(max committed id)` after loading so new task
+  ids don't collide.
+- **Cache the per-requirement RAW loop result only**; re-run naming + dedup + assemble fresh each
+  time (they are cheap deterministic code — keeps cross-requirement dedup correct when old+new mix).
+- CLI: `--cache PATH` (or `--cache-dir`).
+- **Caveat:** helps *re-runs* only; a cold first run computes everything once (so it does nothing for
+  the initial 386 run — B1 is still separate).
+Effort: a few hours (serialization, per-req boundary, id-collision fix all already built/verified).
+**Done when:** re-running an unchanged project is near-instant; changed requirements recompute; a
+retuned preset (bumped CACHE_VERSION) invalidates cleanly.
 
----
+### B5 · Coverage-gap planning
+Today gaps are pass-through escalations. Optionally turn a gap into a plannable item (a task to add
+the missing requirement) vs. keep escalating genuine unknowns.
+**Done when:** coverage gaps yield tasks or questions, not just pass-through.
 
-## Phase 5 — Service + streaming + minimal UI
-Make it a running app, not a script.
-- FastAPI + socket.io, single container (`network_mode: host`), reqoach `store/` bind-mounted
-  read-only. Reuse reqoach's `jobs.py` streaming pattern: `stage`, `plan_item`, `task`,
-  `sequence`, `plan`, `cancelled`, `error`; cooperative cancel.
-- Endpoints: `POST /plans {reqoach_project_id}` → streamed run; `GET /plans/{id}`;
-  `GET /plans` (history). Persist `store/plans/<id>/plan.json` + `meta.json` (atomic writes).
-- Minimal read-only UI: pick a reqoach project → Run → tasks stream in live → dependency
-  view + traceability drawer (why does this task exist?). Priority-colored (`--s1..--s5`).
+### B6 · Acceptance depth
+Use Architect constraints when emitted (upstream emits none yet); make `kind:test` acceptance
+actually executable (a runnable check), beyond the kind-based default.
 
-**Done when:** pick a project in the browser, run, watch tasks appear as each passes the gate,
-inspect the DAG and each task's trace. Verified headless (0 console errors), per reqoach norm.
+### B7 · Builder feedback loop (cross-agent calibration)
+Feed builder's real `built`/`failed` outcomes back to tune the gate — a feasible task that
+repeatedly fails to build is a gate false-positive. Designed, unwired.
 
----
-
-## Later (post-MVP)
-- **Executor** service: drive Gemma per task → verify against `acceptance` → loop. Closes the
-  calibration loop for the granularity gate (§10.3). The Task shape already targets this.
-- **Granularity calibration** from real Gemma success/failure telemetry.
-- **Re-plan diff** after requirements change; **plan editing** UI (split/reorder/accept).
-- **API-based input** (import from a running reqoach instead of shared `store/`).
+### B8 · Optional / lower priority
+Confidence score on the plan; a frame/archetype stage for task-kind policy; use of the Analyst
+`classes[]` routing (also empty upstream until `classify:run`).
 
 ---
 
 ## Cross-cutting
-- **Verification:** validate against real reqoach `store/` data every phase; headless
-  Chromium (0 console errors) once the UI exists; presets curl-checked.
-- **Reuse:** reqoach `AgentServerClient`, `jobs.py` streaming, catalog, dashboard/chart/
-  criticality-color + nav components, single-container deploy.
-- **Non-negotiables (inherited from reqoach):** every task traces to a requirement or gap;
-  every judge degrades, never raises; the plan reports confidence + flags what it could not
-  reduce — it never claims "fully plannable"; local model only, no data leaves the host.
+- **Verification:** every change checked against the live Analyst (`:7803`) + a real Architect
+  handover; deterministic pieces unit-tested; the loop's outputs checked for dup deliverables /
+  dangling edges.
+- **Reuse:** the existing checkpoint serialization and `advance_ids` for B4; the `log=` seam for B2;
+  the reranker service for B3.
+- **Infra note:** raising throughput past ~2× needs the model server's `--parallel` raised — shared
+  VRAM across all agents, a platform decision, not the planner's to flip.

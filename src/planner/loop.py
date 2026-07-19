@@ -10,10 +10,20 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 
 _ids = itertools.count(1)
+
+
+def advance_ids(past: int) -> None:
+    """Restart task-id generation past `past` — used on resume so new tasks don't reuse
+    ids already committed to a checkpoint."""
+    global _ids
+    if past > 0:
+        _ids = itertools.count(past + 1)
 
 
 @dataclass
@@ -27,6 +37,21 @@ class PlanTask:
     feasibility: dict | None = None      # the gate verdict that admitted it
     origin: str = "decomposed"           # decomposed | split | prerequisite | resolved
     traces_to: list[str] = field(default_factory=list)   # source requirement id(s) — no task without a trace
+    named_by: str = "planner"                            # planner | architect (naming precedence)
+    proposed_deliverable: str | None = None              # what we'd have called it, if renamed
+
+
+def _norm(s: str) -> str:
+    """Normalize for equivalence: lowercase alphanumerics only."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def dedup_key(title: str, deliverable: str) -> tuple:
+    """Two tasks are the same work if they produce the same artifact, or are the same
+    stated task. Deliverable is the stronger signal — two tasks writing one file would
+    overwrite each other."""
+    d = _norm(os.path.basename((deliverable or "").strip().split()[0])) if deliverable else ""
+    return ("deliverable", d) if d else ("title", _norm(title))
 
 
 def _mk(t: dict, origin: str, traces_to=None) -> PlanTask:
@@ -98,6 +123,12 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
     feasible: list[PlanTask] = []
     questions: list[dict] = []
     flagged: list[dict] = []
+    # Every task we have created, by equivalence key — so a prerequisite that several
+    # tasks need is built ONCE and they all depend on it, instead of each spawning its own.
+    created: dict[tuple, PlanTask] = {}
+    for t, _, _ in work:
+        created.setdefault(dedup_key(t.title, t.deliverable), t)
+    reused = 0
 
     while work:
         task, refines, avail = work.pop(0)
@@ -124,6 +155,7 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
         elif action == "split":
             children = [_mk(nt, "split", traces_to=task.traces_to) for nt in new]
             for c in children:
+                created.setdefault(dedup_key(c.title, c.deliverable), c)
                 work.append((c, refines + 1, avail))
             log(f"  [split -> {len(children)}] {task.title[:50]}")
         elif action == "prerequisite":
@@ -134,10 +166,21 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
                 flagged.append({"task": task, "feasibility": feas,
                                 "reason": "prerequisite action without a valid new task"})
                 continue
-            work.append((prereq, refines + 1, avail))               # build the prereq
-            task.depends_on.append(prereq.task_id)                  # wire the edge
+            # Reuse an equivalent prerequisite if one already exists (several tasks often
+            # need the same schema/interface) — wire the edge, don't build it twice.
+            key = dedup_key(prereq.title, prereq.deliverable)
+            existing = created.get(key)
+            if existing is not None and existing.task_id != task.task_id:
+                prereq = existing
+                reused += 1
+                log(f"  [prerequisite REUSED] {task.title[:40]} -> {prereq.title[:32]}")
+            else:
+                created[key] = prereq
+                work.append((prereq, refines + 1, avail))           # build the prereq
+                log(f"  [prerequisite] {task.title[:45]} needs -> {prereq.title[:35]}")
+            if prereq.task_id not in task.depends_on:
+                task.depends_on.append(prereq.task_id)              # wire the edge
             work.append((task, refines + 1, avail + [prereq.deliverable]))  # re-judge w/ prereq
-            log(f"  [prerequisite] {task.title[:45]} needs -> {prereq.title[:35]}")
         elif action == "resolve":
             rt = _mk(new[0], "resolved", traces_to=task.traces_to) if new else task
             rt.depends_on = task.depends_on
@@ -148,4 +191,89 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
                             "reason": f"refine returned no usable action ({action})"})
             log(f"  [FLAGGED] {task.title[:55]} (bad refine)")
 
+    if reused:
+        log(f"  ({reused} prerequisite(s) reused instead of duplicated)")
     return {"feasible": feasible, "questions": questions, "flagged": flagged}
+
+
+def dedup_plan(plan: dict, log=print) -> dict:
+    """Merge equivalent tasks produced from different requirements/branches.
+
+    Two tasks that write the same artifact (or state the same work) are ONE task: keeping
+    both makes the builder build it twice, or overwrite it. The survivor absorbs the others'
+    traces_to and dependencies, and every dependency pointing at a merged-away task is
+    rewired onto the survivor so the DAG stays intact.
+    """
+    feasible = plan.get("feasible", [])
+    # Two tasks are the same work if they share EITHER signal: the same artifact (they would
+    # overwrite each other) OR the same stated task (same work, differently named files).
+    # Union-find so a chain (A~B by title, B~C by deliverable) collapses to one task.
+    parent = {t.task_id: t.task_id for t in feasible}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    first_by_title: dict[str, str] = {}
+    first_by_deliv: dict[str, str] = {}
+    for t in feasible:
+        tk = _norm(t.title)
+        dv = (t.deliverable or "").strip()
+        dk = _norm(os.path.basename(dv.split()[0])) if dv else ""
+        if tk:
+            union(first_by_title.setdefault(tk, t.task_id), t.task_id)
+        if dk:
+            union(first_by_deliv.setdefault(dk, t.task_id), t.task_id)
+
+    alias: dict[str, str] = {}          # merged-away task_id -> surviving task_id
+    kept: list[PlanTask] = []
+    survivor: dict[str, PlanTask] = {}  # root -> surviving task
+    for t in feasible:
+        root = find(t.task_id)
+        winner = survivor.get(root)
+        if winner is None:
+            survivor[root] = t
+            kept.append(t)
+            continue
+        alias[t.task_id] = winner.task_id
+        for r in t.traces_to:                       # a merged task still serves its requirement
+            if r not in winner.traces_to:
+                winner.traces_to.append(r)
+        for d in t.depends_on:
+            if d not in winner.depends_on:
+                winner.depends_on.append(d)
+        if len(t.instructions or "") > len(winner.instructions or ""):
+            winner.instructions = t.instructions    # keep the fuller instructions
+
+    for t in kept:                                   # rewire + drop self-edges
+        t.depends_on = sorted({alias.get(d, d) for d in t.depends_on} - {t.task_id})
+
+    # questions/flagged: collapse repeats of the same ask
+    def _uniq(items, keyf):
+        seen, out = set(), []
+        for i in items:
+            k = keyf(i)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(i)
+        return out
+
+    questions = _uniq(plan.get("questions", []),
+                      lambda q: (_norm(q["task"].title), _norm(q.get("question", ""))))
+    flagged = _uniq(plan.get("flagged", []), lambda f: _norm(f["task"].title))
+
+    merged = len(feasible) - len(kept)
+    if merged or len(questions) != len(plan.get("questions", [])):
+        log(f"  dedup: merged {merged} duplicate task(s); "
+            f"questions {len(plan.get('questions', []))}->{len(questions)}, "
+            f"flagged {len(plan.get('flagged', []))}->{len(flagged)}")
+    return {"feasible": kept, "questions": questions, "flagged": flagged,
+            "merged_task_ids": alias}

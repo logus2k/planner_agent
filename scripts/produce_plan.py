@@ -19,6 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from planner import analyst, architecture, loader, pipeline  # noqa: E402
+from planner.checkpoint import Checkpoint  # noqa: E402
 from planner.client import GemmaClient  # noqa: E402
 
 
@@ -33,6 +34,10 @@ def main():
     ap.add_argument("--arch-dir", default=None, help="architect data/architecture root")
     ap.add_argument("--modelled-only", action="store_true",
                     help="plan only requirements the Architect modelled (exercises the join)")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="requirements planned concurrently (threads; default 1 serial)")
+    ap.add_argument("--checkpoint", default=None,
+                    help="JSON-lines WAL path; resumes if it already exists (skips done req_ids)")
     args = ap.parse_args()
 
     pkg = analyst.get_package(args.project_id, base_url=args.analyst, run=args.run)
@@ -70,8 +75,14 @@ def main():
         print(f"sampled {len(reqs)} requirements")
     print()
 
+    ckpt = None
+    if args.checkpoint:
+        os.makedirs(os.path.dirname(os.path.abspath(args.checkpoint)), exist_ok=True)
+        ckpt = Checkpoint(args.checkpoint)
+
     client = GemmaClient()
-    plan_result = pipeline.plan_project(client, reqs, refine_k=args.k, handover=handover)
+    plan_result = pipeline.plan_project(client, reqs, refine_k=args.k, handover=handover,
+                                        workers=args.workers, checkpoint=ckpt)
     plan = pipeline.assemble_plan(ready, plan_result, gaps, ps_version, len(reqs),
                                   handover=handover, planned_req_ids=[r.req_id for r in reqs])
 
