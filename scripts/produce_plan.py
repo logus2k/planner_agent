@@ -19,6 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from planner import analyst, architecture, loader, pipeline  # noqa: E402
+from planner.cache import Cache  # noqa: E402
 from planner.checkpoint import Checkpoint  # noqa: E402
 from planner.client import GemmaClient  # noqa: E402
 
@@ -38,6 +39,9 @@ def main():
                     help="requirements planned concurrently (threads; default 1 serial)")
     ap.add_argument("--checkpoint", default=None,
                     help="JSON-lines WAL path; resumes if it already exists (skips done req_ids)")
+    ap.add_argument("--cache", nargs="?", const="", default=None,
+                    help="memoize per-requirement results across runs; bare --cache uses "
+                         "data/cache/<project_id>.jsonl, or pass an explicit path")
     args = ap.parse_args()
 
     pkg = analyst.get_package(args.project_id, base_url=args.analyst, run=args.run)
@@ -80,9 +84,17 @@ def main():
         os.makedirs(os.path.dirname(os.path.abspath(args.checkpoint)), exist_ok=True)
         ckpt = Checkpoint(args.checkpoint)
 
+    cache = None
+    if args.cache is not None:
+        cache_path = args.cache or os.path.join(
+            os.path.dirname(__file__), "..", "data", "cache", f"{args.project_id}.jsonl")
+        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+        cache = Cache(cache_path)
+        print(f"cache: {cache_path} ({len(cache._entries)} entr(ies), version {cache.version})")
+
     client = GemmaClient()
     plan_result = pipeline.plan_project(client, reqs, refine_k=args.k, handover=handover,
-                                        workers=args.workers, checkpoint=ckpt)
+                                        workers=args.workers, checkpoint=ckpt, cache=cache)
     plan = pipeline.assemble_plan(ready, plan_result, gaps, ps_version, len(reqs),
                                   handover=handover, planned_req_ids=[r.req_id for r in reqs])
 

@@ -35,11 +35,21 @@ def _acceptance(kind: str) -> dict:
             "check": "the artifact compiles/parses and contains no stub/placeholder fingerprints"}
 
 
-def _plan_one_requirement(client, r, handover, refine_budget, refine_k):
+def _plan_one_requirement(client, r, handover, refine_budget, refine_k, cache=None):
     """Decompose ONE requirement against the architecture and run its gate/refine loop.
     Self-contained (own seeds, own loop) so requirements can run concurrently and each
-    result can be checkpointed independently. Returns the loop result dict."""
+    result can be checkpointed independently. Returns the loop result dict.
+
+    When a cache is supplied, a hit on (requirement text + architecture context) short-
+    circuits the LLM work entirely — the cached loop result is reused verbatim (its task ids
+    are kept disjoint from freshly generated ones by the caller's advance_ids)."""
     ctx = architecture.architecture_context(handover, r.req_id) if handover else ""
+    if cache is not None:
+        hit = cache.get(r.text, ctx)
+        if hit is not None:
+            hit["_arch_ctx"] = bool(ctx)
+            hit["_cached"] = True
+            return hit
     seeds = []
     for t in stages.decompose(client, r.text, arch_context=ctx):
         t["traces_to"] = [r.req_id]
@@ -47,29 +57,39 @@ def _plan_one_requirement(client, r, handover, refine_budget, refine_k):
     res = plan_tasks(client, seeds, refine_budget=refine_budget, refine_k=refine_k,
                      log=lambda *a: None)          # quiet per-req; caller logs a summary
     res["_arch_ctx"] = bool(ctx)
+    if cache is not None:
+        cache.put(r.req_id, r.text, ctx, res)
     return res
 
 
 def plan_project(client, requirements: list, refine_budget: int = 3, refine_k: int = 1,
                  handover: dict | None = None, workers: int = 1, checkpoint=None,
-                 log=print) -> dict:
+                 cache=None, log=print) -> dict:
     """Plan a requirement set: process each requirement independently (decompose -> gate/
     refine loop), then globally name (architect precedence) and dedup.
 
-    Per-requirement processing is what makes this both concurrent AND resumable:
+    Per-requirement processing is what makes this concurrent, resumable AND memoizable:
       - workers > 1 fans requirements out over a thread pool (the client is thread-safe;
         with 1 backend slot they queue, but it stays correct and speeds up when slots rise).
       - checkpoint (a JSON-lines WAL) commits each requirement's result as it finishes, so a
-        restart skips already-done req_ids and plans only the delta.
+        restart skips already-done req_ids and plans only the delta (within-run resume).
+      - cache (a per-project store keyed on input hash) reuses a requirement's result across
+        runs, so a re-plan after a small change reprocesses only the changed requirements.
     A requirement absent from the Architect handover simply gets no context — not an error."""
     prior = []
     done = set()
+    # Advance the task-id counter past everything already on disk (checkpoint WAL and/or
+    # cache), so freshly generated ids never collide with reused ones.
+    id_base = 0
     if checkpoint is not None:
         prior = checkpoint.load_all()
         done = {rid for rid, _ in prior}
-        advance_ids(checkpoint.max_task_num())     # new ids won't collide with committed ones
+        id_base = max(id_base, checkpoint.max_task_num())
         if done:
             log(f"resuming: {len(done)} requirement(s) already checkpointed, skipping them")
+    if cache is not None:
+        id_base = max(id_base, cache.max_task_num())
+    advance_ids(id_base)
     todo = [r for r in requirements if r.req_id not in done]
     log(f"planning {len(todo)} requirement(s) (workers={workers})"
         + (f" · handover: {sum(1 for r in todo if architecture.for_requirement(handover, r.req_id))} modelled"
@@ -83,12 +103,14 @@ def plan_project(client, requirements: list, refine_budget: int = 3, refine_k: i
             checkpoint.append(rid, res)
         new_results.append((rid, res))
         n = len(new_results) + len(done)
+        cached = " (cached)" if res.get("_cached") else ""
         log(f"  [{n}/{total}] {rid}: {len(res['feasible'])}F {len(res['questions'])}Q "
-            f"{len(res['flagged'])}Fl")
+            f"{len(res['flagged'])}Fl{cached}")
 
     if workers > 1 and todo:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_plan_one_requirement, client, r, handover, refine_budget, refine_k): r
+            futs = {ex.submit(_plan_one_requirement, client, r, handover, refine_budget,
+                              refine_k, cache): r
                     for r in todo}
             for fut in concurrent.futures.as_completed(futs):
                 r = futs[fut]
@@ -99,9 +121,13 @@ def plan_project(client, requirements: list, refine_budget: int = 3, refine_k: i
     else:
         for r in todo:
             try:
-                _record(r.req_id, _plan_one_requirement(client, r, handover, refine_budget, refine_k))
+                _record(r.req_id, _plan_one_requirement(client, r, handover, refine_budget,
+                                                        refine_k, cache))
             except Exception as e:                 # noqa: BLE001
                 log(f"  ! {r.req_id} failed: {type(e).__name__}: {e}")
+
+    if cache is not None and (cache.hits or cache.misses):
+        log(f"cache: {cache.hits} hit(s), {cache.misses} miss(es) · version {cache.version}")
 
     # aggregate prior (from checkpoint) + newly planned
     agg = {"feasible": [], "questions": [], "flagged": []}

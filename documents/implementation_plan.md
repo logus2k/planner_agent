@@ -56,24 +56,26 @@ Today the DAG has only prerequisite edges. Add cross-task dependency detection v
 shared entity / producer→consumer, LLM-confirm above threshold. Cycle-check.
 **Done when:** the DAG carries real cross-task edges beyond prerequisites, cycle-free.
 
-### B4 · Memoization / per-project cache — **IMMEDIATE NEXT TASK**
-Cache per-requirement loop results by input-hash in a per-project file so a re-plan after a small
-change reprocesses only the changed requirements. Concrete design (turnkey — most parts already exist):
-- **Generalize `checkpoint.py` into a hash-keyed project cache** (it subsumes resume: a cached input
-  hash = already-done). Key = `sha1(req.text + arch_context + CACHE_VERSION)`; `CACHE_VERSION` folds
-  in the decompose/gate/refine prompt versions so retuning a preset auto-invalidates.
-- **Store:** per-project file `data/cache/<project_id>.jsonl`, reusing `_res_to_dict`/`_res_from_dict`.
-- **Wire into `pipeline.plan_project`** per-requirement loop: compute key → hit reuses the cached
-  result, miss plans + stores. Call `loop.advance_ids(max committed id)` after loading so new task
-  ids don't collide.
-- **Cache the per-requirement RAW loop result only**; re-run naming + dedup + assemble fresh each
-  time (they are cheap deterministic code — keeps cross-requirement dedup correct when old+new mix).
-- CLI: `--cache PATH` (or `--cache-dir`).
-- **Caveat:** helps *re-runs* only; a cold first run computes everything once (so it does nothing for
-  the initial 386 run — B1 is still separate).
-Effort: a few hours (serialization, per-req boundary, id-collision fix all already built/verified).
-**Done when:** re-running an unchanged project is near-instant; changed requirements recompute; a
-retuned preset (bumped CACHE_VERSION) invalidates cleanly.
+### B4 · Memoization / per-project cache — **DONE + verified (2026-07-19)**
+Per-requirement loop results are memoized by input-hash in a per-project file, so a re-plan after a
+small change reprocesses only the changed requirements. As built:
+- **`src/planner/cache.py` · `Cache`** — a per-project JSON-lines store (`data/cache/<project_id>.jsonl`).
+  Key = `sha1(CACHE_VERSION + req.text + arch_context)`. `cache_version()` folds in the *contents* of
+  the decompose/gate/refine prompt files (`prompts/*.txt`) → retuning any of those prompts changes the
+  version and every entry it could have shaped stops matching (auto-invalidation). Reuses checkpoint's
+  `_res_to_dict`/`_res_from_dict`; append-only, last-write-wins, thread-safe (lock).
+- **Wired into `pipeline.plan_project` / `_plan_one_requirement`**: compute `ctx` once, cache-`get`
+  on (text, ctx) → hit short-circuits the LLM work; miss plans then `put`s. Naming + dedup + assemble
+  ALWAYS re-run fresh over the aggregated (cached + new) set (cross-requirement dedup stays correct).
+- **Id-collision handling**: `plan_project` calls `advance_ids(max(checkpoint_max, cache_max))` before
+  planning, so reused entries keep their (lower) ids and new tasks get ids strictly above them. Because
+  every run advances past the current max before generating, cache ids stay globally distinct/monotonic.
+- **CLI**: `--cache` (bare → `data/cache/<project_id>.jsonl`, or `--cache PATH`).
+- **Caveat (holds):** helps *re-runs* only; a cold first run computes everything once (does nothing for
+  the initial 386 cold run — B1 is still separate).
+- **Verified**: offline mechanics test (roundtrip, key sensitivity, version invalidation, id-monotonicity)
+  + live two-pass run (`--limit 4 --workers 2`): run 1 = 4 miss / ~50 s, run 2 = 4 hit / **0.11 s**,
+  plan.json **byte-identical**, cache file did not grow on the hit run.
 
 ### B5 · Coverage-gap planning
 Today gaps are pass-through escalations. Optionally turn a gap into a plannable item (a task to add
