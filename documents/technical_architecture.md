@@ -1,6 +1,6 @@
 # Planner Agent — Technical Architecture (as-built)
 
-Status: **AS-BUILT**, 2026-07-19. This document describes the system that exists in the code,
+Status: **AS-BUILT**, 2026-07-20. This document describes the system that exists in the code,
 not an intended design. Where a capability is designed-but-not-built it says so explicitly.
 It supersedes the earlier aspirational version (the 6-stage pipeline described previously was
 never implemented as such — see §10).
@@ -62,8 +62,9 @@ context, planner-chosen names). When present it provides, keyed by `req_id`:
 
 ## 3. The pipeline (what actually runs)
 
-Entry: `pipeline.plan_project(client, requirements, refine_budget=3, refine_k=1, handover=None)`
-→ `pipeline.assemble_plan(...)`. Driven by `scripts/produce_plan.py <PROJECT_ID>`.
+Entry: `pipeline.plan_project(client, requirements, refine_budget=3, refine_k=1, handover=None,
+workers=1, checkpoint=None, cache=None)` → `pipeline.assemble_plan(...)`. Driven by
+`scripts/produce_plan.py <PROJECT_ID>`.
 
 ```
 requirements ─► DECOMPOSE (per requirement, against architecture if present)
@@ -89,8 +90,12 @@ One LLM call per requirement proposes candidate tasks `{title, kind, deliverable
 adopt the Architect's structure instead of inventing one.
 
 All three LLM stages now use registered presets (temp 0). `stages.decompose` calls the
-`planner_decompose` preset (2048 / temp 0); its prompt is identical to the former inline one, so
-this reconciled config without changing behavior.
+`planner_decompose` preset (`max_tokens 2048`, `temp 0.0`); its prompt is identical to the former
+inline path. This reconciled a **config drift**, and the payoff is **determinism** (temp `0.2 → 0.0`
++ one pinned config), **not** memory or latency: `max_tokens` is an *output-generation cap*
+(`n_predict`), not a context window — it does not shrink the KV cache (sized by the slot's context,
+unchanged) or the time-to-first-token (input prefill). Lowering it only bounds the worst-case
+generation tail. (Recurring misconception, flagged here on purpose.)
 
 ### 3.2 Feasibility gate — `loop._gate` → preset `planner_feasibility_reason`
 A reasoning-scripted judge (temp 0, max_tokens 1024) returns
@@ -140,6 +145,33 @@ Repeated questions/flags collapse too.
 ### 3.7 Assemble — `pipeline.assemble_plan`
 Builds the `plan.json` contract (§4): feasible tasks with acceptance/dependencies/traceability,
 questions, flagged, coverage gaps, architecture provenance + open issues, and the DAG.
+
+### 3.8 Memoization (optional) — `src/planner/cache.py`
+A per-project cache that lets a **re-plan reprocess only the changed requirements**. It wraps the
+per-requirement step (§3, decompose → gate/refine): before planning a requirement, `plan_project`
+computes a key and looks it up; a hit reuses the stored loop result and skips all LLM work, a miss
+plans then stores it. Enabled with `--cache` (bare → `data/cache/<project_id>.jsonl`, or an explicit
+path).
+- **Exact-hash, not semantic.** Key = `sha1(cache_version + requirement.text + architecture_context)`
+  — byte-for-byte. A requirement whose text is *reworded but equivalent* misses; there is no
+  embedding/reranker similarity here (that is the house path for meaning-based matching, deliberately
+  not used for a cache).
+- **Auto-invalidation.** `cache_version()` folds in the *contents* of the decompose/gate/refine
+  prompt files, so retuning any of those prompts changes the version and every entry it could have
+  shaped stops matching — stale results are never silently reused. (Verified live: editing the
+  decompose prompt dropped all populated entries; restoring it brought them back.)
+- **Only the raw per-requirement result is cached.** Naming, dedup, and assembly always re-run fresh
+  over the aggregated (cached + newly-planned) set, so cross-requirement dedup stays correct when old
+  and new results mix.
+- **Id-collision safe.** `plan_project` calls `advance_ids(max(checkpoint_max, cache_max))` before
+  planning, so reused entries keep their (lower) task ids and freshly generated ids sit strictly above
+  them; because every run advances past the current max first, cache ids stay globally distinct and
+  monotonic across runs.
+- **Scope caveat (load-bearing):** this helps **re-runs only**. A cold first run still computes
+  everything once — memoization does nothing for the pending 386-requirement cold run.
+
+Reuses checkpoint's serialization (`_res_to_dict`/`_res_from_dict`); distinct from `checkpoint.py`,
+which keys on `req_id` for *within-run* resume and is discarded once a run completes.
 
 ---
 
@@ -209,12 +241,17 @@ the inline `complete_json/complete_text` path carries an in-code system prompt +
   independently (decompose → gate/refine loop), then aggregates → names → dedups globally.
   `--workers N` fans requirements over a thread pool (the client is thread-safe); within a
   requirement the gate/refine loop is still serial (`while work:`).
-- **Backend: 2 llama.cpp slots** (verified: the model server runs `--parallel 2`, and 2 concurrent
-  requests complete in ~1 request's time). So `--workers 2` gives a real ~2x speedup now; going beyond
-  2x is what would need `--parallel` raised (a shared-VRAM tradeoff).
+- **Backend: 2 llama.cpp slots, 32K context each** (verified 2026-07-20: the `llama-vision` container
+  runs `--parallel 2`; the active model `Gemma 4 E4B` is configured `context: 65536` total, which
+  llama.cpp splits across the 2 slots → 32768 per slot; and 2 concurrent requests complete in ~1
+  request's time). So `--workers 2` gives a real ~2x speedup now; going beyond 2x is what would need
+  `--parallel` raised (a shared-VRAM tradeoff across all agents on the shared server).
 - **Resumable.** `--checkpoint PATH` writes a per-requirement JSON-lines WAL; a restart skips
   done `req_id`s and plans only the delta (`advance_ids` avoids task-id collisions). So an
   interruption costs minutes, not the whole run.
+- **Memoizable (re-runs).** `--cache` reuses unchanged requirements' results across runs (§3.8):
+  a re-plan after a small edit reprocesses only the changed requirements. Verified: a warm 4-req
+  re-run dropped from ~50s to ~0.1s with a byte-identical plan. Helps re-runs only — not a cold run.
 - **Volume:** ~20 LLM calls per requirement (measured) → a full 386-run is ~7–8k calls; with
   `--workers 2` on 2 slots that is roughly halved. Largest run to date: **~5 requirements** — the
   full 386 run has not yet been done (see §9).
@@ -283,7 +320,8 @@ src/planner/
   loop.py         plan_tasks (gate→refine loop, refine_budget) + dedup_plan (union-find)
                   + advance_ids (resume-safe task ids)                                    (§3)
   checkpoint.py   per-requirement JSON-lines WAL (append/resume) — makes long runs resumable
-  pipeline.py     plan_project (per-req, --workers threads, --checkpoint) + assemble_plan  (§3,§4,§7)
+  cache.py        per-project memoization cache (input-hash keyed; prompt-content invalidation)  (§3.8)
+  pipeline.py     plan_project (per-req, --workers threads, --checkpoint, --cache) + assemble_plan  (§3,§4,§7)
 prompts/          planner_feasibility_reason (gate) · planner_refine · planner_decompose · …
 scripts/          register_planner_agents · produce_plan (entry point)
                   + dev-time validation harnesses (tune_*, measure_*, run_opencode_outcomes)

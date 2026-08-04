@@ -26,8 +26,10 @@ No build system, no test framework, no packaging (stdlib only). "Tests" are dev 
   `python scripts/register_planner_agents.py`  — prompts live in `prompts/*.txt`; to change a
   judge's behavior, edit the prompt file and re-register.
 - **Produce a plan** (the product entry point):
-  `python scripts/produce_plan.py <PROJECT_ID> [--limit N] [--workers N] [--checkpoint PATH] [--modelled-only]`
+  `python scripts/produce_plan.py <PROJECT_ID> [--limit N] [--workers N] [--checkpoint PATH] [--cache [PATH]] [--modelled-only]`
   → `data/plans/<PROJECT_ID>.plan.json`. `<PROJECT_ID>` is an Analyst project id (`curl :7803/projects`).
+  `--cache` memoizes per-requirement results across runs (input-hash keyed; a re-plan reprocesses
+  only changed requirements — helps re-runs only, not a cold run).
 - **Verify a change** (there is no unit-test runner): `python3 -m py_compile src/planner/*.py scripts/*.py`,
   then run `produce_plan.py --limit 4` and read the output. Prefer verifying against live services.
 - **Dev-only harnesses** (`tune_*.py`, `measure_*.py`, `validate_*.py`, `run_opencode_outcomes.py`):
@@ -40,8 +42,9 @@ No build system, no test framework, no packaging (stdlib only). "Tests" are dev 
 - **Analyst** `:7803` — `GET /projects/{pid}/package` is the requirements input (`ANALYST_URL`).
 - **agent_server** `:7701` — hosts/routes the Gemma presets (`AGENT_SERVER_URL`); admin API at
   `/admin/api/agents/{name}` for preset config.
-- **llama.cpp** `:8500` — the actual Gemma model server (currently `--parallel 2` = 2 slots; verify
-  before assuming — it has changed). Shared across all agents; raising slots is a platform decision.
+- **llama.cpp** `:8500` — the actual Gemma model server (verified 2026-07-20: `--parallel 2` = 2 slots;
+  active model `Gemma 4 E4B`, `context: 65536` total → 32K per slot; re-verify before assuming — it has
+  changed before). Shared across all agents; raising slots is a platform decision.
 - **Architect handover** (optional) — `{ARCHITECT_ARCH_DIR}/<project_id>/planner_handover.json`;
   absent → planner runs with planner-chosen names (loaded defensively).
 
