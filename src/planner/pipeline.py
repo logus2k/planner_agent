@@ -18,7 +18,7 @@ import glob
 import json
 import os
 
-from . import architecture, loader, stages
+from . import architecture, capabilities as caps_mod, loader, stages
 from .loop import advance_ids, dedup_plan, plan_tasks
 
 
@@ -35,7 +35,61 @@ def _acceptance(kind: str) -> dict:
             "check": "the artifact compiles/parses and contains no stub/placeholder fingerprints"}
 
 
-def _plan_one_requirement(client, r, handover, refine_budget, refine_k, cache=None):
+# One coherent target stack, so the plan doesn't mix .java/.ts/.py/.sql arbitrarily. Language
+# choice is the Planner's (architect doc §5); we make it once here, by kind.
+_EXT_BY_KIND = {"schema": ".json", "config": ".yaml", "docs": ".md", "test": ".py", "code": ".py"}
+
+
+def _snake(name: str) -> str:
+    """Filesystem-safe snake_case: split camelCase and collapse every non-alphanumeric run to a
+    single underscore. Pure string ops (no regex) — this is lexical normalization, not matching."""
+    out: list[str] = []
+    for i, ch in enumerate(name or ""):
+        if ch.isalnum():
+            prev = name[i - 1] if i else ""
+            if ch.isupper() and out and out[-1] != "_" and (prev.islower() or prev.isdigit()):
+                out.append("_")
+            out.append(ch.lower())
+        elif out and out[-1] != "_":
+            out.append("_")
+    return "".join(out).strip("_")
+
+
+def _normalize_deliverable(raw: str, kind: str, title: str) -> str:
+    """Turn an LLM-proposed deliverable into a real filename in the target stack: drop any
+    method-signature/prose and language extension the model tacked on (`.java`, `.ts`,
+    `.java (interface)`, `.updateMenu(...)`), snake_case the base, and apply the ONE extension
+    the kind implies. Falls back to the task title when the model produced junk."""
+    ext = _EXT_BY_KIND.get((kind or "code").lower(), ".py")
+    base = (raw or "").strip().split("(")[0]      # drop a method signature like foo(a, b)
+    base = os.path.splitext(base)[0]              # drop a real trailing extension (.java, .ts…)
+    base = _snake(base)
+    # A base that is just a language/format token (the model wrote ".java (interface)") carries
+    # no real name — derive from the title instead.
+    if len(base) < 3 or base in {"java", "ts", "js", "py", "sql", "json", "yaml", "yml", "md", "tsx", "jsx"}:
+        base = _snake(title)
+    return (base or "artifact") + ext
+
+
+def _normalize_deliverables(tasks: list) -> int:
+    """Normalize every PLANNER-named deliverable to the target stack. Architect-named ones are
+    already canonical (their suggested_module), so leave them. Records the original name so the
+    divergence stays visible in `planner_proposed_deliverable`."""
+    n = 0
+    for t in tasks:
+        if getattr(t, "named_by", "planner") == "architect":
+            continue
+        fixed = _normalize_deliverable(t.deliverable, t.kind, t.title)
+        if fixed != t.deliverable:
+            if t.proposed_deliverable is None:
+                t.proposed_deliverable = t.deliverable
+            t.deliverable = fixed
+            n += 1
+    return n
+
+
+def _plan_one_requirement(client, r, handover, refine_budget, refine_k, cache=None,
+                          capabilities=""):
     """Decompose ONE requirement against the architecture and run its gate/refine loop.
     Self-contained (own seeds, own loop) so requirements can run concurrently and each
     result can be checkpointed independently. Returns the loop result dict.
@@ -51,11 +105,12 @@ def _plan_one_requirement(client, r, handover, refine_budget, refine_k, cache=No
             hit["_cached"] = True
             return hit
     seeds = []
-    for t in stages.decompose(client, r.text, arch_context=ctx):
+    for t in stages.decompose(client, r.text, arch_context=ctx, capabilities=capabilities):
         t["traces_to"] = [r.req_id]
         seeds.append(t)
     res = plan_tasks(client, seeds, refine_budget=refine_budget, refine_k=refine_k,
-                     log=lambda *a: None)          # quiet per-req; caller logs a summary
+                     log=lambda *a: None,          # quiet per-req; caller logs a summary
+                     capabilities=capabilities)
     res["_arch_ctx"] = bool(ctx)
     if cache is not None:
         cache.put(r.req_id, r.text, ctx, res)
@@ -64,7 +119,7 @@ def _plan_one_requirement(client, r, handover, refine_budget, refine_k, cache=No
 
 def plan_project(client, requirements: list, refine_budget: int = 3, refine_k: int = 1,
                  handover: dict | None = None, workers: int = 1, checkpoint=None,
-                 cache=None, log=print) -> dict:
+                 cache=None, log=print, caps_block: str | None = None) -> dict:
     """Plan a requirement set: process each requirement independently (decompose -> gate/
     refine loop), then globally name (architect precedence) and dedup.
 
@@ -76,6 +131,10 @@ def plan_project(client, requirements: list, refine_budget: int = 3, refine_k: i
       - cache (a per-project store keyed on input hash) reuses a requirement's result across
         runs, so a re-plan after a small change reprocesses only the changed requirements.
     A requirement absent from the Architect handover simply gets no context — not an error."""
+    # Platform capabilities (vision, auth, embeddings, …) — fetched once so the decomposer and
+    # feasibility judge know a task that CALLS a provided capability is feasible. Project-agnostic.
+    if caps_block is None:
+        caps_block = caps_mod.block(caps_mod.compact(caps_mod.fetch()))
     prior = []
     done = set()
     # Advance the task-id counter past everything already on disk (checkpoint WAL and/or
@@ -110,7 +169,7 @@ def plan_project(client, requirements: list, refine_budget: int = 3, refine_k: i
     if workers > 1 and todo:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(_plan_one_requirement, client, r, handover, refine_budget,
-                              refine_k, cache): r
+                              refine_k, cache, caps_block): r
                     for r in todo}
             for fut in concurrent.futures.as_completed(futs):
                 r = futs[fut]
@@ -122,7 +181,7 @@ def plan_project(client, requirements: list, refine_budget: int = 3, refine_k: i
         for r in todo:
             try:
                 _record(r.req_id, _plan_one_requirement(client, r, handover, refine_budget,
-                                                        refine_k, cache))
+                                                        refine_k, cache, caps_block))
             except Exception as e:                 # noqa: BLE001
                 log(f"  ! {r.req_id} failed: {type(e).__name__}: {e}")
 
@@ -141,6 +200,11 @@ def plan_project(client, requirements: list, refine_budget: int = 3, refine_k: i
     if handover:
         renamed = _apply_architect_naming(agg["feasible"], handover)
         log(f"architect naming applied to {renamed} task(s)")
+    # Normalize planner-invented deliverables to one coherent stack BEFORE dedup, so the Builder
+    # gets real filenames and two tasks that resolve to the same file merge instead of colliding.
+    normed = _normalize_deliverables(agg["feasible"])
+    if normed:
+        log(f"normalized {normed} planner deliverable(s) to the target stack")
     # One artifact = one task, across ALL requirements: merge equivalents.
     return dedup_plan(agg, log=log)
 
@@ -182,13 +246,17 @@ def assemble_plan(source: dict, plan: dict, coverage_gaps: list[dict],
             acc = {"kind": "constraint",
                    "check": "; ".join(f"{c['name']}: {c['expression']}" for c in cons),
                    "source": "architect"}
+        # depends_on must reference tasks that are actually in the plan. A prerequisite can end
+        # up flagged/questioned (not feasible) — keep only edges to feasible tasks so the field
+        # is consistent with `graph.edges` and the Builder can sequence on it.
+        deps = [d for d in t.depends_on if d in feasible_ids]
         tasks.append({
             "task_id": t.task_id, "title": t.title, "kind": t.kind,
             "deliverable": deliverable, "deliverable_named_by": source_of_name,
             "planner_proposed_deliverable": t.proposed_deliverable,
             "instructions": t.instructions,
             "acceptance": acc,
-            "depends_on": t.depends_on, "traces_to": t.traces_to, "origin": t.origin,
+            "depends_on": deps, "traces_to": t.traces_to, "origin": t.origin,
             "feasibility": {"verdict": (t.feasibility or {}).get("verdict"),
                             "reasoning": (t.feasibility or {}).get("reasoning", "")},
         })

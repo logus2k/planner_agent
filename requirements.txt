@@ -1,0 +1,4 @@
+# The Planner core is stdlib-only (urllib for Analyst + agent_server). The HTTP service layer
+# is all that needs third-party packages.
+fastapi
+uvicorn[standard]

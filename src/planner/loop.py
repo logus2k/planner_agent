@@ -61,22 +61,28 @@ def _mk(t: dict, origin: str, traces_to=None) -> PlanTask:
                     traces_to=list(traces_to if traces_to is not None else t.get("traces_to") or []))
 
 
-def _gate(client, task: PlanTask, available: list[str] | None = None) -> dict:
+def _gate(client, task: PlanTask, available: list[str] | None = None,
+          capabilities: str = "") -> dict:
     """Feasibility gate. `available` lists prerequisite deliverables assumed present
-    (prerequisite-aware re-judge — fixes 'dependent task infeasible forever')."""
+    (prerequisite-aware re-judge — fixes 'dependent task infeasible forever'). `capabilities`
+    is the platform-capabilities block (a task that CALLS a provided capability is feasible)."""
     u = (f"TITLE: {task.title}\nKIND: {task.kind}\n"
          f"DELIVERABLE: {task.deliverable}\nINSTRUCTIONS: {task.instructions}")
     if available:
         u += ("\nAVAILABLE PREREQUISITES (assume these already exist and are usable): "
               + "; ".join(available))
+    if capabilities:
+        u += capabilities
     return client.preset_json("planner_feasibility_reason", u) or {"verdict": "unknown"}
 
 
-def _refine_once(client, task: PlanTask, feas: dict) -> dict:
+def _refine_once(client, task: PlanTask, feas: dict, capabilities: str = "") -> dict:
     u = (f"TASK TITLE: {task.title}\nKIND: {task.kind}\n"
          f"DELIVERABLE: {task.deliverable}\nINSTRUCTIONS: {task.instructions}\n"
          f"MISSING (the gap): {feas.get('missing','')}\n"
          f"BLOCKING CRITERION: {feas.get('blocking_criterion','')}")
+    if capabilities:
+        u += capabilities
     return client.preset_json("planner_refine", u) or {}
 
 
@@ -86,14 +92,14 @@ def _title_key(ref: dict) -> tuple:
             tuple(sorted((t.get("title", "") for t in (ref.get("new_tasks") or [])))))
 
 
-def _refine(client, task: PlanTask, feas: dict, k: int = 1) -> dict:
+def _refine(client, task: PlanTask, feas: dict, k: int = 1, capabilities: str = "") -> dict:
     """Self-consistent refine. With k=1, a single call. With k>1, sample k times,
     MAJORITY-VOTE the action (the categorical decision that drives control flow),
     then among the winning-action samples pick the modal (title-set) representative —
     deterministic tie-break. Turns per-call generative variation into a stable consensus."""
     if k <= 1:
-        return _refine_once(client, task, feas)
-    samples = [_refine_once(client, task, feas) for _ in range(k)]
+        return _refine_once(client, task, feas, capabilities)
+    samples = [_refine_once(client, task, feas, capabilities) for _ in range(k)]
     samples = [s for s in samples if s.get("action")]
     if not samples:
         return {}
@@ -107,7 +113,7 @@ def _refine(client, task: PlanTask, feas: dict, k: int = 1) -> dict:
 
 
 def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
-               refine_k: int = 1, log=print) -> dict:
+               refine_k: int = 1, log=print, capabilities: str = "") -> dict:
     """Run the bounded gate->refine loop over seed tasks. Returns the plan:
     feasible tasks (+ dependency edges), escalated questions, and flagged tasks.
 
@@ -132,7 +138,7 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
 
     while work:
         task, refines, avail = work.pop(0)
-        feas = _gate(client, task, avail)
+        feas = _gate(client, task, avail, capabilities)
         v = feas.get("verdict")
         if v == "feasible":
             task.feasibility = feas
@@ -145,7 +151,7 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
             log(f"  [FLAGGED after {refines} refines] {task.title[:52]} ({v})")
             continue
 
-        ref = _refine(client, task, feas, k=refine_k)
+        ref = _refine(client, task, feas, k=refine_k, capabilities=capabilities)
         action = ref.get("action")
         new = ref.get("new_tasks") or []
         if action == "question":

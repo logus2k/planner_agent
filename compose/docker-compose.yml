@@ -1,0 +1,29 @@
+services:
+  planner-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        APP_UID: "${APP_UID:-1000}"
+        APP_GID: "${APP_GID:-1000}"
+    image: planner-agent:0.1.0
+    container_name: planner-agent
+    restart: unless-stopped
+    # host networking: the shared services (agent_server :7701, analyst :7803) are reachable
+    # on localhost, same as the Analyst and Architect.
+    network_mode: host
+    environment:
+      # The service listens on :7805 (uvicorn CMD). Kept off the reserved ports of the other
+      # agents (analyst :7803, architect :7804).
+      ANALYST_URL: "http://localhost:7803"
+      AGENT_SERVER_URL: "http://localhost:7701"
+      PLANNER_DATA_DIR: "/app/data"
+      # Read the Architect handover from the project git repos (repo layout: <root>/<pid>/architecture/).
+      ARCHITECT_ARCH_DIR: "/app/project-repos"
+      PROJECT_REPOS_ROOT: "/app/project-repos"
+      PLANNER_WORKERS: "2"
+    volumes:
+      # plans + checkpoints are the agent's own; survive rebuilds
+      - ../data:/app/data
+      # the per-project git repos (FACTORY owns git); the Planner writes plans/ here, FACTORY commits
+      - /home/logus/env/project-repos:/app/project-repos

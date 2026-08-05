@@ -26,13 +26,18 @@ _DECOMPOSE_SYS = (
 )
 
 
-def decompose(client, req_text: str, quality_hint: str = "", arch_context: str = "") -> list[dict]:
+def decompose(client, req_text: str, quality_hint: str = "", arch_context: str = "",
+              capabilities: str = "") -> list[dict]:
     user = req_text if not quality_hint else f"{req_text}\n\n[quality note: {quality_hint}]"
     if arch_context:
         # The Architect already decided what the system is made of — decompose against it
         # instead of inventing a structure per task.
         user += ("\n\nARCHITECTURE (authoritative — use these names, do not invent components):\n"
                  + arch_context)
+    if capabilities:
+        # A requirement backed by a provided capability → a task that CALLS it, not one that
+        # builds the model/algorithm (already a formatted block from capabilities.block()).
+        user += capabilities
     # Use the registered preset (temp 0, deterministic) — the prompt is identical to the
     # former inline _DECOMPOSE_SYS, so this only reconciles config, not behavior.
     res = client.preset_json("planner_decompose", user)

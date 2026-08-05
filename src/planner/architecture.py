@@ -31,20 +31,32 @@ _EXT_BY_KIND = {"schema": ".json", "config": ".yaml", "docs": ".md",
                 "test": ".py", "code": ".py"}
 
 
+def _candidate_paths(project_id: str, root: str | None = None) -> list[str]:
+    base = root or ARCH_ROOT
+    # Two layouts are supported: the project GIT REPO (`<repo>/<pid>/architecture/…`, where the
+    # Architect now publishes) and the legacy flat data dir (`<data>/<pid>/…`).
+    return [os.path.join(base, project_id, "architecture", "planner_handover.json"),
+            os.path.join(base, project_id, "planner_handover.json")]
+
+
 def handover_path(project_id: str, root: str | None = None) -> str:
-    return os.path.join(root or ARCH_ROOT, project_id, "planner_handover.json")
+    for p in _candidate_paths(project_id, root):
+        if os.path.isfile(p):
+            return p
+    return _candidate_paths(project_id, root)[-1]
 
 
 def load_handover(project_id: str, root: str | None = None) -> dict | None:
     """Load the architecture handover, or None if the Architect hasn't produced one."""
-    path = handover_path(project_id, root)
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
+    for path in _candidate_paths(project_id, root):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+    return None
 
 
 def readiness(h: dict | None) -> dict:
