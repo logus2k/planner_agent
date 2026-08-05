@@ -131,10 +131,11 @@ def plan_project(client, requirements: list, refine_budget: int = 3, refine_k: i
       - cache (a per-project store keyed on input hash) reuses a requirement's result across
         runs, so a re-plan after a small change reprocesses only the changed requirements.
     A requirement absent from the Architect handover simply gets no context — not an error."""
-    # Platform capabilities (vision, auth, embeddings, …) — fetched once so the decomposer and
-    # feasibility judge know a task that CALLS a provided capability is feasible. Project-agnostic.
+    # Platform capabilities injection is OFF by default: an A/B on E4B showed it did not reduce
+    # flagged/questions (it slightly increased them). The endpoint + wiring stay available — pass
+    # a non-empty caps_block explicitly to re-enable for an experiment.
     if caps_block is None:
-        caps_block = caps_mod.block(caps_mod.compact(caps_mod.fetch()))
+        caps_block = ""
     prior = []
     done = set()
     # Advance the task-id counter past everything already on disk (checkpoint WAL and/or
