@@ -41,7 +41,8 @@ _PROMPT_FILES = (
     "planner_feasibility_reason.txt",
     "planner_refine.txt",
 )
-_CACHE_SCHEMA = "v1"  # bump if the cached record shape changes (independent of prompt content)
+_CACHE_SCHEMA = "v2"  # bump if the cached record shape changes (independent of prompt content)
+# v2: flagged records now persist `feasibility` (verdict/reasoning/missing) + `gap`.
 
 
 def _prompts_dir() -> str:

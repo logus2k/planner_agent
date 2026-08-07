@@ -81,16 +81,58 @@ def snake(name: str) -> str:
     return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s).lower()
 
 
+def _component_index(h: dict | None) -> dict:
+    """Map component name -> {attributes, module, responsibility}, resolved across handover
+    layouts. In a 2.0 handover the per-requirement `components` are bare NAME STRINGS and the
+    typed attributes live only in the top-level `components` list (responsibility under
+    `by_aspect`); this index resolves a name to the full record either way."""
+    idx: dict[str, dict] = {}
+    for c in (h or {}).get("components", []) or []:
+        n = c.get("name") if isinstance(c, dict) else None
+        if not n:
+            continue
+        idx[n] = {"attributes": c.get("attributes") or [],
+                  "module": c.get("suggested_module") or snake(n),
+                  "responsibility": c.get("responsibility", "")}
+    # by_aspect components carry `responsibility` (and attributes) — fill in what's missing.
+    for asp in ((h or {}).get("by_aspect") or {}).values():
+        for c in (asp or {}).get("components", []) or []:
+            n = c.get("name") if isinstance(c, dict) else None
+            if not n:
+                continue
+            rec = idx.setdefault(n, {"attributes": [], "module": snake(n), "responsibility": ""})
+            if not rec.get("responsibility"):
+                rec["responsibility"] = c.get("responsibility", "")
+            if not rec.get("attributes"):
+                rec["attributes"] = c.get("attributes") or []
+    return idx
+
+
 def component_names(h: dict | None, req_id: str) -> list[dict]:
-    """Components the Architect defined for this requirement, with a module hint."""
+    """Components the Architect defined for this requirement, with a module hint and the
+    Architect's typed attributes (its data model). Carrying the attributes through is what lets
+    the decomposer build against the real schema instead of asking the author to re-supply
+    fields the Architect already specified. Handles BOTH handover versions: 1.0 (per-requirement
+    components are objects carrying their own attributes) and 2.0 (name strings; attributes
+    resolved from the top-level `components` list)."""
+    if not h:
+        return []
+    idx = _component_index(h)
     out = []
     for c in for_requirement(h, req_id).get("components", []) or []:
-        name = c.get("name")
+        name = c if isinstance(c, str) else c.get("name")
         if not name:
             continue
-        out.append({"name": name,
+        info = idx.get(name)
+        if info is None and isinstance(c, dict):        # 1.0 inline object absent from the index
+            info = {"attributes": c.get("attributes") or [],
                     "module": c.get("suggested_module") or snake(name),
-                    "responsibility": c.get("responsibility", "")})
+                    "responsibility": c.get("responsibility", "")}
+        info = info or {"attributes": [], "module": snake(name), "responsibility": ""}
+        attrs = [{"name": a.get("name"), "type": a.get("type")}
+                 for a in info["attributes"] if isinstance(a, dict) and a.get("name")]
+        out.append({"name": name, "module": info["module"],
+                    "responsibility": info["responsibility"], "attributes": attrs})
     return out
 
 
@@ -98,7 +140,7 @@ def constraints_for(h: dict | None, req_id: str) -> list[dict]:
     """Validated SysML constraint expressions — safe to quote in acceptance criteria.
     `expression: null` means the model proposed nothing usable, so we skip it."""
     return [c for c in for_requirement(h, req_id).get("constraints", []) or []
-            if c.get("expression")]
+            if isinstance(c, dict) and c.get("expression")]
 
 
 def open_issues_for(h: dict | None, req_ids) -> list[dict]:
@@ -135,22 +177,37 @@ def architect_deliverable(h: dict | None, req_ids, kind: str, task_text: str = "
     return None            # ambiguous -> keep the planner's own (more specific) name
 
 
-def architecture_context(h: dict | None, req_id: str, max_chars: int = 700) -> str:
+def architecture_context(h: dict | None, req_id: str, max_chars: int = 1500) -> str:
     """Compact context block to give the decomposer, so tasks are generated against the
-    Architect's structure instead of inventing one."""
+    Architect's structure instead of inventing one. Includes each component's typed attributes
+    (the Architect's data model) so the decomposer builds the schema the Architect already
+    specified rather than escalating a question for fields that are right here."""
     d = for_requirement(h, req_id)
     if not d:
         return ""
     parts = []
     comps = component_names(h, req_id)
     if comps:
-        parts.append("COMPONENTS (use these names): "
-                     + "; ".join(f"{c['name']} — {c['responsibility']}".strip(" —") for c in comps))
-    fns = [f.get("name") for f in d.get("functions", []) or [] if f.get("name")]
+        lines = []
+        for c in comps:
+            line = f"{c['name']} — {c['responsibility']}".strip(" —")
+            if c.get("attributes"):
+                line += " [fields: " + ", ".join(
+                    f"{a['name']}: {a['type']}" for a in c["attributes"]) + "]"
+            lines.append(line)
+        parts.append("COMPONENTS (use these names AND their listed fields — do NOT ask for "
+                     "fields already given here): " + "; ".join(lines))
+    # functions/interfaces are objects in 1.0 and bare name strings in 2.0 — accept both.
+    fns = [(f if isinstance(f, str) else f.get("name")) for f in d.get("functions") or []]
+    fns = [f for f in fns if f]
     if fns:
         parts.append("FUNCTIONS: " + ", ".join(fns))
-    ifaces = [f"{i.get('name')} ({i.get('supplier')}→{i.get('consumer')})"
-              for i in d.get("interfaces", []) or [] if i.get("name")]
+    ifaces = []
+    for i in d.get("interfaces") or []:
+        if isinstance(i, str):
+            ifaces.append(i)
+        elif isinstance(i, dict) and i.get("name"):
+            ifaces.append(f"{i.get('name')} ({i.get('supplier')}→{i.get('consumer')})")
     if ifaces:
         parts.append("INTERFACES: " + "; ".join(ifaces))
     cons = [f"{c.get('name')}: {c.get('expression')}" for c in constraints_for(h, req_id)]

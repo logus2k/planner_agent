@@ -61,11 +61,23 @@ def _mk(t: dict, origin: str, traces_to=None) -> PlanTask:
                     traces_to=list(traces_to if traces_to is not None else t.get("traces_to") or []))
 
 
+def _arch_block(arch_context: str) -> str:
+    """The Architect's component/field context, labelled AUTHORITATIVE so the gate/refiner
+    treat listed fields as SPECIFIED (not a gap to question). Empty when no handover."""
+    if not arch_context:
+        return ""
+    return ("\n\nARCHITECTURE CONTEXT (authoritative — any entity fields listed here ARE "
+            "specified; do NOT treat them as unknown or ask for them):\n" + arch_context)
+
+
 def _gate(client, task: PlanTask, available: list[str] | None = None,
-          capabilities: str = "") -> dict:
+          capabilities: str = "", arch_context: str = "") -> dict:
     """Feasibility gate. `available` lists prerequisite deliverables assumed present
     (prerequisite-aware re-judge — fixes 'dependent task infeasible forever'). `capabilities`
-    is the platform-capabilities block (a task that CALLS a provided capability is feasible)."""
+    is the platform-capabilities block (a task that CALLS a provided capability is feasible).
+    `arch_context` is the Architect's component+field schema for this requirement — passing it
+    lets the gate see that a data model's fields are already specified instead of re-deriving
+    'fields unspecified' blind and escalating a needless question."""
     u = (f"TITLE: {task.title}\nKIND: {task.kind}\n"
          f"DELIVERABLE: {task.deliverable}\nINSTRUCTIONS: {task.instructions}")
     if available:
@@ -73,16 +85,19 @@ def _gate(client, task: PlanTask, available: list[str] | None = None,
               + "; ".join(available))
     if capabilities:
         u += capabilities
+    u += _arch_block(arch_context)
     return client.preset_json("planner_feasibility_reason", u) or {"verdict": "unknown"}
 
 
-def _refine_once(client, task: PlanTask, feas: dict, capabilities: str = "") -> dict:
+def _refine_once(client, task: PlanTask, feas: dict, capabilities: str = "",
+                 arch_context: str = "") -> dict:
     u = (f"TASK TITLE: {task.title}\nKIND: {task.kind}\n"
          f"DELIVERABLE: {task.deliverable}\nINSTRUCTIONS: {task.instructions}\n"
          f"MISSING (the gap): {feas.get('missing','')}\n"
          f"BLOCKING CRITERION: {feas.get('blocking_criterion','')}")
     if capabilities:
         u += capabilities
+    u += _arch_block(arch_context)
     return client.preset_json("planner_refine", u) or {}
 
 
@@ -92,14 +107,15 @@ def _title_key(ref: dict) -> tuple:
             tuple(sorted((t.get("title", "") for t in (ref.get("new_tasks") or [])))))
 
 
-def _refine(client, task: PlanTask, feas: dict, k: int = 1, capabilities: str = "") -> dict:
+def _refine(client, task: PlanTask, feas: dict, k: int = 1, capabilities: str = "",
+            arch_context: str = "") -> dict:
     """Self-consistent refine. With k=1, a single call. With k>1, sample k times,
     MAJORITY-VOTE the action (the categorical decision that drives control flow),
     then among the winning-action samples pick the modal (title-set) representative —
     deterministic tie-break. Turns per-call generative variation into a stable consensus."""
     if k <= 1:
-        return _refine_once(client, task, feas, capabilities)
-    samples = [_refine_once(client, task, feas, capabilities) for _ in range(k)]
+        return _refine_once(client, task, feas, capabilities, arch_context)
+    samples = [_refine_once(client, task, feas, capabilities, arch_context) for _ in range(k)]
     samples = [s for s in samples if s.get("action")]
     if not samples:
         return {}
@@ -113,7 +129,8 @@ def _refine(client, task: PlanTask, feas: dict, k: int = 1, capabilities: str = 
 
 
 def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
-               refine_k: int = 1, log=print, capabilities: str = "") -> dict:
+               refine_k: int = 1, log=print, capabilities: str = "",
+               arch_context: str = "") -> dict:
     """Run the bounded gate->refine loop over seed tasks. Returns the plan:
     feasible tasks (+ dependency edges), escalated questions, and flagged tasks.
 
@@ -138,7 +155,7 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
 
     while work:
         task, refines, avail = work.pop(0)
-        feas = _gate(client, task, avail, capabilities)
+        feas = _gate(client, task, avail, capabilities, arch_context)
         v = feas.get("verdict")
         if v == "feasible":
             task.feasibility = feas
@@ -151,7 +168,8 @@ def plan_tasks(client, seed_tasks: list[dict], refine_budget: int = 3,
             log(f"  [FLAGGED after {refines} refines] {task.title[:52]} ({v})")
             continue
 
-        ref = _refine(client, task, feas, k=refine_k, capabilities=capabilities)
+        ref = _refine(client, task, feas, k=refine_k, capabilities=capabilities,
+                      arch_context=arch_context)
         action = ref.get("action")
         new = ref.get("new_tasks") or []
         if action == "question":

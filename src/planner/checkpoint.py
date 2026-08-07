@@ -26,7 +26,11 @@ def _res_to_dict(req_id: str, res: dict) -> dict:
         "feasible": [asdict(t) for t in res.get("feasible", [])],
         "questions": [{"task": asdict(q["task"]), "question": q.get("question", ""),
                        "gap": q.get("gap", "")} for q in res.get("questions", [])],
-        "flagged": [{"task": asdict(f["task"]), "reason": f.get("reason", "")}
+        # Keep the feasibility verdict (verdict/reasoning/missing) + the gap on flagged tasks,
+        # so "did not converge" carries a real diagnostic and can be routed to the resolver.
+        "flagged": [{"task": asdict(f["task"]), "reason": f.get("reason", ""),
+                     "feasibility": f.get("feasibility") or {},
+                     "gap": (f.get("feasibility") or {}).get("missing", "")}
                     for f in res.get("flagged", [])],
     }
 
@@ -36,8 +40,9 @@ def _res_from_dict(d: dict) -> dict:
         "feasible": [PlanTask(**t) for t in d.get("feasible", [])],
         "questions": [{"task": PlanTask(**q["task"]), "question": q.get("question", ""),
                        "gap": q.get("gap", "")} for q in d.get("questions", [])],
-        "flagged": [{"task": PlanTask(**f["task"]), "feasibility": None,
-                     "reason": f.get("reason", "")} for f in d.get("flagged", [])],
+        "flagged": [{"task": PlanTask(**f["task"]), "feasibility": f.get("feasibility"),
+                     "reason": f.get("reason", ""), "gap": f.get("gap", "")}
+                    for f in d.get("flagged", [])],
     }
 
 

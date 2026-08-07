@@ -70,15 +70,26 @@ def publish_plan_to_repo(pid: str, plan: dict, repos_root: str | None = None) ->
 
 
 def plan_to_gaps(plan: dict) -> list[dict]:
-    """The Planner's genuine questions as requirement gaps for the Analyst resolver.
-    Each carries the req_id it traces to + the gap + the question. requirement_text is
-    left for the Analyst to fill from its own review (authoritative current text)."""
+    """The Planner's open items as requirement gaps for the Analyst resolver — BOTH the
+    genuine questions AND the flagged "did not converge" tasks (which are dead-ends
+    otherwise). Each carries the req_id it traces to + the gap + a question. requirement_text
+    is left for the Analyst to fill from its own review (authoritative current text)."""
     gaps = []
     for q in plan.get("questions", []):
         traces = q.get("traces_to") or []
         if traces:
             gaps.append({"req_id": traces[0], "gap": q.get("gap", ""),
-                         "question": q.get("question", "")})
+                         "question": q.get("question", ""), "origin": "question"})
+    for f in plan.get("flagged", []):
+        traces = f.get("traces_to") or []
+        if not traces:
+            continue
+        detail = f.get("missing") or f.get("detail") or f.get("reason", "")
+        title = f.get("task_title", "")
+        gaps.append({"req_id": traces[0], "gap": detail, "origin": "flagged",
+                     "question": (f"The task “{title}” could not be made buildable"
+                                  + (f": {detail}" if detail else "")
+                                  + ". Clarify or complete the requirement so it can be built.")})
     return gaps
 
 

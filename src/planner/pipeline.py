@@ -110,7 +110,7 @@ def _plan_one_requirement(client, r, handover, refine_budget, refine_k, cache=No
         seeds.append(t)
     res = plan_tasks(client, seeds, refine_budget=refine_budget, refine_k=refine_k,
                      log=lambda *a: None,          # quiet per-req; caller logs a summary
-                     capabilities=capabilities)
+                     capabilities=capabilities, arch_context=ctx)
     res["_arch_ctx"] = bool(ctx)
     if cache is not None:
         cache.put(r.req_id, r.text, ctx, res)
@@ -280,6 +280,8 @@ def assemble_plan(source: dict, plan: dict, coverage_gaps: list[dict],
         "questions": [{"task_title": q["task"].title, "question": q["question"],
                        "gap": q["gap"], "traces_to": q["task"].traces_to} for q in plan["questions"]],
         "flagged": [{"task_title": f["task"].title, "reason": f["reason"],
+                     "detail": (f.get("feasibility") or {}).get("reasoning", ""),
+                     "missing": (f.get("feasibility") or {}).get("missing", ""),
                      "traces_to": f["task"].traces_to} for f in plan["flagged"]],
         "coverage_gaps": coverage_gaps,
         # Architect-flagged issues touching the requirements we planned. NOT decoration:
