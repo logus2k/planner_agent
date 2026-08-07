@@ -24,6 +24,7 @@ class Requirement:
     # Analyst routing contract (empty until the Analyst's classify:run has been run):
     classes: list = field(default_factory=list)       # functional|structural|interface|…
     constraints: list = field(default_factory=list)   # closed vocab: latency, throughput, …
+    answered_gaps: list = field(default_factory=list)  # human answers to prior planner questions
 
 
 def _avg(scores: dict) -> float:

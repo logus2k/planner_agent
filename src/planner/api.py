@@ -158,9 +158,20 @@ class JobManager:
         job.progress = {"stage": phase, "status": "progress", "done": 0, "total": total}
         plan_result = pipeline.plan_project(
             client, reqs, handover=handover, workers=WORKERS, cache=cache, log=_log)
-        return pipeline.assemble_plan(
+        plan = pipeline.assemble_plan(
             ready, plan_result, gaps, ps_version, len(reqs),
             handover=handover, planned_req_ids=[r.req_id for r in reqs])
+        # Advisory plan-plausibility review: for each requirement, do its tasks realize it
+        # (no DRIFT task, no explicitly-stated core action left uncovered)? Attached to the
+        # plan as `plan_review` for the human/FACTORY to read — never a gate, never fails the run.
+        try:
+            from . import plan_judge
+            plan["plan_review"] = plan_judge.run(
+                plan, {r.req_id: r.text for r in reqs}, client)
+        except Exception as e:  # advisory only
+            plan["plan_review"] = {"results": {}, "implausible": [], "incomplete": [],
+                                   "error": f"{type(e).__name__}: {e}"}
+        return plan
 
     def _publish(self, job: Job, plan: dict) -> dict:
         """Write plan.json to data/plans and publish+commit into the project repo."""

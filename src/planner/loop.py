@@ -228,11 +228,24 @@ def dedup_plan(plan: dict, log=print) -> dict:
     traces_to and dependencies, and every dependency pointing at a merged-away task is
     rewired onto the survivor so the DAG stays intact.
     """
+    from . import rerank as _rerank
+    #: Sigmoid reranker score above which two candidate tasks are confirmed to be the SAME
+    #: work and may merge. Same as the analyst gap-dedup threshold. True duplicates score
+    #: ~0.99; same-entity-different-work (e.g. reservation SUBMIT vs reservation MODEL, both
+    #: in reservation.py) scores ~0.07 — so this cleanly blocks the filename over-merge that
+    #: shotgunned traces_to across unrelated requirements.
+    MERGE_THRESHOLD = 0.80
+
     feasible = plan.get("feasible", [])
-    # Two tasks are the same work if they share EITHER signal: the same artifact (they would
-    # overwrite each other) OR the same stated task (same work, differently named files).
-    # Union-find so a chain (A~B by title, B~C by deliverable) collapses to one task.
+    # A shared normalized title OR deliverable-filename basename makes two tasks merge
+    # CANDIDATES — NOT a merge. String identity is not proof of same work: many distinct
+    # endpoints/models legitimately live in one entity file (reservation.py), so a filename
+    # match over-merges distinct operations into one task and spreads its traces_to across
+    # requirements it does not serve. Each candidate pair is confirmed with the reranker
+    # before union; unconfirmed candidates stay separate (over-merge is the proven harm).
+    # Union-find so a confirmed chain (A~B by title, B~C by deliverable) collapses to one task.
     parent = {t.task_id: t.task_id for t in feasible}
+    by_id = {t.task_id: t for t in feasible}
 
     def find(x):
         while parent[x] != x:
@@ -245,16 +258,39 @@ def dedup_plan(plan: dict, log=print) -> dict:
         if ra != rb:
             parent[rb] = ra
 
-    first_by_title: dict[str, str] = {}
-    first_by_deliv: dict[str, str] = {}
+    def _text(tid: str) -> str:
+        t = by_id[tid]
+        return f"{t.title}. {(t.instructions or '')[:300]}"
+
+    groups: dict[tuple, list[str]] = {}
     for t in feasible:
         tk = _norm(t.title)
         dv = (t.deliverable or "").strip()
         dk = _norm(os.path.basename(dv.split()[0])) if dv else ""
         if tk:
-            union(first_by_title.setdefault(tk, t.task_id), t.task_id)
+            groups.setdefault(("title", tk), []).append(t.task_id)
         if dk:
-            union(first_by_deliv.setdefault(dk, t.task_id), t.task_id)
+            groups.setdefault(("deliv", dk), []).append(t.task_id)
+
+    rerank_calls = 0
+    for _key, ids in groups.items():
+        if len(ids) < 2:
+            continue
+        # Greedy clustering within the candidate group: each task joins the existing cluster
+        # representative the reranker confirms is the SAME WORK (>= threshold); otherwise it
+        # becomes a new representative. Tasks already unioned via another key are skipped.
+        reps: list[str] = [ids[0]]
+        for tid in ids[1:]:
+            if any(find(tid) == find(r) for r in reps):
+                continue
+            scores = _rerank.rerank(_text(tid), [_text(r) for r in reps])
+            rerank_calls += 1
+            if scores:
+                best = max(range(len(reps)), key=lambda i: scores[i])
+                if scores[best] >= MERGE_THRESHOLD:
+                    union(reps[best], tid)
+                    continue
+            reps.append(tid)
 
     alias: dict[str, str] = {}          # merged-away task_id -> surviving task_id
     kept: list[PlanTask] = []
@@ -296,7 +332,8 @@ def dedup_plan(plan: dict, log=print) -> dict:
 
     merged = len(feasible) - len(kept)
     if merged or len(questions) != len(plan.get("questions", [])):
-        log(f"  dedup: merged {merged} duplicate task(s); "
+        log(f"  dedup: merged {merged} duplicate task(s) "
+            f"({rerank_calls} reranker confirmation(s)); "
             f"questions {len(plan.get('questions', []))}->{len(questions)}, "
             f"flagged {len(plan.get('flagged', []))}->{len(flagged)}")
     return {"feasible": kept, "questions": questions, "flagged": flagged,

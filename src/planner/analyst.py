@@ -86,6 +86,7 @@ def requirements_from_package(pkg: dict) -> list[Requirement]:
                              "C7_verifiable": scores.get("C7")},
             classes=list(r.get("classes") or []),
             constraints=list(r.get("constraints") or []),
+            answered_gaps=list(r.get("answered_gaps") or []),
         ))
     return out
 

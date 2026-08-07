@@ -88,6 +88,24 @@ def _normalize_deliverables(tasks: list) -> int:
     return n
 
 
+def _answers_block(answered_gaps) -> str:
+    """Human answers to this requirement's earlier planner questions — authoritative resolved
+    content the decomposer/gate must treat as SPECIFIED, so an answered question is never
+    re-asked. Empty when there are none."""
+    items = []
+    for g in answered_gaps or []:
+        q = (g.get("question") or "").strip()
+        a = (g.get("answer") or g.get("resolution") or "").strip()
+        if not a:
+            continue
+        items.append(f"- Q: {q}\n  ANSWER: {a}" if q else f"- {a}")
+    if not items:
+        return ""
+    return ("\n\nANSWERED (human-supplied resolutions for THIS requirement's earlier open "
+            "questions — treat these as SPECIFIED: build against them and do NOT ask them "
+            "again):\n" + "\n".join(items))
+
+
 def _plan_one_requirement(client, r, handover, refine_budget, refine_k, cache=None,
                           capabilities=""):
     """Decompose ONE requirement against the architecture and run its gate/refine loop.
@@ -98,6 +116,10 @@ def _plan_one_requirement(client, r, handover, refine_budget, refine_k, cache=No
     circuits the LLM work entirely — the cached loop result is reused verbatim (its task ids
     are kept disjoint from freshly generated ones by the caller's advance_ids)."""
     ctx = architecture.architecture_context(handover, r.req_id) if handover else ""
+    # A human's answers to THIS requirement's earlier questions are authoritative resolved
+    # content — fold them into the context so the decomposer/gate treat them as specified and
+    # never re-ask. They also change the cache key, so an answered requirement recomputes.
+    ctx = ctx + _answers_block(getattr(r, "answered_gaps", None))
     if cache is not None:
         hit = cache.get(r.text, ctx)
         if hit is not None:
