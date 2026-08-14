@@ -1,12 +1,12 @@
-"""Minimal agent_server client for the validation harness.
+"""agent_server client — the house pattern (same as analyst_agent / architect_agent).
 
-Talks to agent_server's OpenAI-compatible endpoint the same way reqoach's proven
-escape hatch does (score/setlevel.py): raw `model: "gemma-4"` with an inline
-system+user message pair and `response_format: json_object`. Uses only the stdlib
-so the harness runs with no dependencies.
+One stateless call per item: `model` carries the agent PRESET NAME (a registered persona), we
+send only the user content, and the preset supplies the system prompt + sampling. The Planner's
+reasoning roles are `planner_*` personas registered in agent_server (decompose, feasibility,
+refine, outcome, plan_judge, execute) — the prompts live on the server, not in this code.
 
-Every call degrades, never raises (reqoach's contract): a transport/parse failure
-returns None and the caller decides how to record it.
+Stdlib-only. Every call degrades, never raises: a transport/parse failure returns None (JSON) or
+None (text) and the caller decides how to record it.
 """
 
 from __future__ import annotations
@@ -23,7 +23,10 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
 
 def _parse_json(content: str) -> dict | None:
-    """reqoach's 3-tier parse: raw -> fence-strip -> brace-slice."""
+    """3-tier parse: raw -> fence-strip -> brace-slice. Strips a leading <think>...</think> block
+    first (thinking-enabled models emit reasoning, with braces, before the JSON)."""
+    if "</think>" in content:
+        content = content.rsplit("</think>", 1)[1]
     content = content.strip()
     try:
         return json.loads(content)
@@ -43,82 +46,28 @@ def _parse_json(content: str) -> dict | None:
 
 
 class GemmaClient:
-    # Slot context is 32K (input+output share it). Inputs here are small, so an
-    # explicit generous output cap keeps artifacts from being silently truncated by
-    # an unknown server default while staying well inside one slot's budget.
-    def __init__(self, base_url: str | None = None, model: str = "gemma-4",
-                 timeout: float = 300.0, max_tokens: int = 8192):
+    """Calls agent_server presets by name (the documented A1 pattern). Not a raw-model client —
+    every reasoning role is a registered `planner_*` persona; sampling + system prompt live in
+    the preset, callers send only user content."""
+
+    def __init__(self, base_url: str | None = None, timeout: float = 300.0):
         self.base_url = (base_url or os.environ.get(
             "AGENT_SERVER_URL", "http://localhost:7701")).rstrip("/")
-        self.model = model
         self.timeout = timeout
-        self.max_tokens = max_tokens
         self.calls = 0
         self.total_s = 0.0
         self.truncated = 0            # completions that hit the length cap
         self._lock = threading.Lock()  # counters are touched from worker threads
 
-    def complete_json(self, system: str, user: str,
-                      temperature: float | None = None,
-                      max_tokens: int | None = None) -> dict | None:
-        """Inline system+user -> parsed JSON dict, or None on any failure."""
-        return self._call(system, user, temperature, max_tokens, json_mode=True)
-
-    def preset_json(self, agent: str, user: str) -> dict | None:
-        """Call an agent_server PRESET by name (reqoach's A1 pattern): the preset
-        supplies the system prompt + sampling; we send only the user content and
-        ask for JSON. This is the deployable path — the prompt lives on the server,
-        not in this code."""
-        payload = {
-            "model": agent,
-            "messages": [{"role": "user", "content": user}],
-            "response_format": {"type": "json_object"},
-        }
+    def _post(self, agent: str, user: str, json_mode: bool):
+        """POST one user message to a preset. Returns (content, hit_cap) or (None, False)."""
+        payload = {"model": agent, "messages": [{"role": "user", "content": user}]}
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         req = urllib.request.Request(
             f"{self.base_url}/v1/chat/completions",
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
-        t0 = time.time()
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode())
-            content = data["choices"][0]["message"]["content"]
-        except (urllib.error.URLError, KeyError, IndexError, ValueError,
-                TimeoutError) as e:
-            with self._lock:
-                self.calls += 1
-                self.total_s += time.time() - t0
-            print(f"    ! preset {agent} failed: {type(e).__name__}: {str(e)[:100]}")
-            return None
-        with self._lock:
-            self.calls += 1
-            self.total_s += time.time() - t0
-        return _parse_json(content)
-
-    def complete_text(self, system: str, user: str,
-                      temperature: float | None = None,
-                      max_tokens: int | None = None) -> str | None:
-        """Inline system+user -> raw text (for the execute stage's artifact)."""
-        return self._call(system, user, temperature, max_tokens, json_mode=False)
-
-    def _call(self, system: str, user: str, temperature, max_tokens, json_mode: bool):
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": user}],
-            "chat_template_kwargs": {"enable_thinking": False},
-            "max_tokens": max_tokens or self.max_tokens,
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        if temperature is not None:
-            payload["temperature"] = temperature
-        req = urllib.request.Request(
-            f"{self.base_url}/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         t0 = time.time()
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -131,16 +80,23 @@ class GemmaClient:
             with self._lock:
                 self.calls += 1
                 self.total_s += time.time() - t0
-            print(f"    ! LLM call failed: {type(e).__name__}: {str(e)[:120]}")
-            return None
+            print(f"    ! preset {agent} failed: {type(e).__name__}: {str(e)[:100]}")
+            return None, False
         with self._lock:
             self.calls += 1
             self.total_s += time.time() - t0
             if hit_cap:
                 self.truncated += 1
         if hit_cap:
-            # Surface truncation loudly — a cut-off artifact would poison the
-            # outcome judgment, exactly what we must not let happen silently.
-            print(f"    ! TRUNCATED at max_tokens={payload['max_tokens']} "
-                  f"(finish_reason=length) — result may be incomplete")
-        return _parse_json(content) if json_mode else content
+            print(f"    ! {agent} TRUNCATED (finish_reason=length) — result may be incomplete")
+        return content, hit_cap
+
+    def preset_json(self, agent: str, user: str) -> dict | None:
+        """Call a preset expecting a JSON object back. Parsed dict, or None on failure."""
+        content, _ = self._post(agent, user, json_mode=True)
+        return _parse_json(content) if content is not None else None
+
+    def preset_text(self, agent: str, user: str) -> str | None:
+        """Call a preset expecting raw text back (e.g. the execute stage's artifact)."""
+        content, _ = self._post(agent, user, json_mode=False)
+        return content

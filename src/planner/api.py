@@ -123,8 +123,22 @@ class Job:
                 "elapsed_s": round(time.time() - self.started_at) if self.started_at else None}
 
 
+def _factory_emit(pid, lane, stage, status="progress", message=None, progress=None):
+    """Best-effort: push a stage event to the FACTORY socket.io hub (the Analyst relay) so the pipeline
+    Overview's lane updates LIVE instead of by polling. Never breaks a run on telemetry."""
+    import json as _j, os as _o, urllib.request as _u
+    try:
+        url = _o.environ.get("FACTORY_RELAY_URL", "http://localhost:7803").rstrip("/")
+        data = _j.dumps({"lane": lane, "stage": stage, "status": status,
+                         "message": message, "progress": progress}).encode()
+        _u.urlopen(_u.Request(f"{url}/relay/{pid}", data=data,
+                   headers={"Content-Type": "application/json"}, method="POST"), timeout=2)
+    except Exception:
+        pass
+
+
 class JobManager:
-    """Owns planner jobs; runs each in a worker thread. Polling-only (no socket.io)."""
+    """Owns planner jobs; live lane updates over socket.io via the Analyst relay (_factory_emit)."""
 
     def __init__(self) -> None:
         self.jobs: dict[str, Job] = {}
@@ -218,6 +232,7 @@ class JobManager:
     def _run_planner(self, job: Job) -> None:
         job.status = "running"
         job.started_at = time.time()
+        _factory_emit(job.project_id, "planning", "plan", "running", "Planning started")
         try:
             client = GemmaClient()
             cache = Cache(os.path.join(DATA_DIR, "cache", f"{job.project_id}.jsonl"))
@@ -261,9 +276,12 @@ class JobManager:
                             **{k: result.get(k) for k in
                                ("feasible", "questions", "flagged", "coverage_gaps",
                                 "reqs_refined")}}
+            _factory_emit(job.project_id, "planning", "done", "done",
+                          f"{result.get('feasible', '?')} feasible tasks", job.progress)
         except Exception as e:  # noqa: BLE001 — surface any pipeline failure to the client
             job.status = "error"
             job.error = f"{type(e).__name__}: {e}"
+            _factory_emit(job.project_id, "planning", "error", "error", job.error)
 
     def create_planner_run(self, pid: str, actor: str | None = None) -> Job:
         job = Job(job_id=uuid.uuid4().hex, project_id=pid, actor=actor)

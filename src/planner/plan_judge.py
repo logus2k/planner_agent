@@ -11,56 +11,19 @@ judgement is the unreliable dimension. So the reliable signal we trust is DRIFT 
 to a requirement that does something the requirement never asked for) plus the deterministic
 ZERO-TASK case (a requirement with no tasks at all). `complete` is advisory-soft.
 
-ADVISORY, not a gate. Uses the planner's inline system-prompt path (like the feasibility /
-outcome judges) — no separate agent registration. PLAN_JUDGE_SYSTEM_PROMPT is the source of
-truth.
+ADVISORY, not a gate. Runs through the `planner_plan_judge` agent_server persona (the house
+pattern) — the prompt lives on the server, like every other planner role.
 """
 
 from __future__ import annotations
 
-PLAN_JUDGE_SYSTEM_PROMPT = (
-    "You are a software PLAN judge. You are given ONE requirement and the list of TASKS a "
-    "planner decomposed it into (each task has a title, a single deliverable, and "
-    "instructions). Judge whether the tasks, TAKEN TOGETHER, plausibly realize the "
-    "requirement.\n\n"
-    "Flag ONLY these — name the category in each issue:\n"
-    "1. DRIFT — a specific task whose actual PURPOSE is a DIFFERENT feature or an unrelated "
-    "capability: work that belongs to another requirement's domain entirely, not this one. "
-    "Name the offending task. This is NARROW. Do NOT flag: reasonable supporting work a stated "
-    "capability obviously needs (a schema, model, interface or type DEFINITION, repository, "
-    "endpoint, or storage/util helper); a task that merely DEFINES an interface/schema/"
-    "signature instead of implementing behavior (that is normal decomposition, not drift); an "
-    "IMPLEMENTATION DETAIL a task names (a specific database such as SQLite, a library, a data "
-    "type, or an added id/foreign-key field); or extra fields and plumbing that support the "
-    "capability. A task is DRIFT only if it implements a capability the requirement never "
-    "asks for — not because it is low-level, a definition, or names a technical choice.\n"
-    "2. INCOMPLETE — an ESSENTIAL, explicitly-stated part of the requirement that NO task "
-    "addresses at all. Only flag a clearly-missing core action the requirement names in "
-    "words; do NOT invent extra tasks, do NOT demand tests/validation/error-handling/edge "
-    "cases the requirement does not state, and do NOT flag thinness or missing detail. In "
-    "particular, do NOT demand a specific internal structure the requirement does not name — "
-    "a repository/data-access layer, an interface/abstraction, a schema, a service class, or "
-    "any particular decomposition: if a task performs the stated action, the requirement is "
-    "covered even when the plan realizes it differently than you would.\n\n"
-    "Set \"plausible\": false ONLY if you find a DRIFT task. Set \"complete\": false ONLY if an "
-    "explicitly-stated essential part is entirely missing. When unsure, choose true. NEVER "
-    "flag: naming, task granularity, ordering, non-functional concerns (auth, logging, "
-    "performance) the requirement does not mention, or a task merely being high-level. "
-    "CRITICALLY: a task that only DEFINES or DECLARES something (an interface, schema, model, "
-    "type, or signature) WITHOUT implementing behavior is NORMAL decomposition — it is NEVER "
-    "drift and NEVER incomplete; and a task that adds a field, column, id, or foreign key not "
-    "spelled out in the requirement is NOT drift. \"It only defines and does not implement\" is "
-    "NOT a valid reason to flag anything.\n\n"
-    "Output ONLY JSON: {\"complete\": true|false, \"plausible\": true|false, "
-    "\"issues\": [{\"type\": \"drift|incomplete\", \"detail\": \"<one sentence>\"}], "
-    "\"confidence\": 0.0-1.0}"
-)
+PLAN_JUDGE_AGENT = "planner_plan_judge"
 
 
 def _fmt_task(t: dict) -> str:
     title = t.get("title", "")
     deliv = t.get("deliverable", "")
-    instr = (t.get("instructions", "") or "")[:240]
+    instr = t.get("instructions", "") or ""
     return f"- {title} [deliverable: {deliv}]: {instr}"
 
 
@@ -74,7 +37,7 @@ def judge_requirement(req_text: str, tasks: list[dict], client) -> dict:
                 "confidence": 1.0}
     user = ("REQUIREMENT:\n" + (req_text or "") + "\n\nTASKS decomposed from it:\n"
             + "\n".join(_fmt_task(t) for t in tasks))
-    out = client.complete_json(PLAN_JUDGE_SYSTEM_PROMPT, user, temperature=0.0) or {}
+    out = client.preset_json(PLAN_JUDGE_AGENT, user) or {}
     raw = out.get("issues") or []
     valid = [i for i in raw if isinstance(i, dict)
              and str(i.get("type", "")).strip().lower().replace("-", "_") in ("drift", "incomplete")]
