@@ -149,7 +149,27 @@ def open_issues_for(h: dict | None, req_ids) -> list[dict]:
     if not h:
         return []
     want = set(req_ids or [])
-    return [i for i in (h.get("open_issues") or []) if i.get("req_id") in want]
+    # The Architect has emitted open issues as bare STRINGS as well as dicts. A string
+    # carries no req_id, so it cannot be filtered — and calling .get() on it killed a
+    # 2.4-hour planning run at the final assembly step, losing all of it. Accept both
+    # shapes: filter dicts by req_id, and keep a string when it names a wanted
+    # requirement (else keep it as a general issue rather than silently dropping the
+    # Architect's own unfinished work).
+    out = []
+    for i in (h.get("open_issues") or []):
+        if isinstance(i, dict):
+            # One issue can name MANY requirements (e.g. unmodeled_requirement lists
+            # every uncovered one), so match on the whole set, not just the first.
+            ids = [r for r in (i.get("req_ids") or []) if r] or (
+                [i["req_id"]] if i.get("req_id") else [])
+            if not ids or any(r in want for r in ids):
+                out.append(i)
+        elif isinstance(i, str):
+            named = [r for r in want if r and r in i]
+            out.append({"kind": "unstructured", "reason": i,
+                        "req_id": named[0] if named else None,
+                        "req_ids": named})
+    return out
 
 
 def architect_deliverable(h: dict | None, req_ids, kind: str, task_text: str = "") -> str | None:
